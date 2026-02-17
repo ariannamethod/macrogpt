@@ -59,6 +59,9 @@ macrogpt_ckpt.json
 *.pkl
 *.npz
 
+# Go build artifacts
+macrogpt_bin
+
 # IDE
 .idea/
 .vscode/
