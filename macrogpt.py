@@ -73,6 +73,9 @@ class Config:
     temperature: float = 0.85
     top_k: int = 40
     top_p: float = 0.92
+    # sampling extras (more GPT-3/4-ish coherence)
+    min_p: float = 0.06          # drop tokens below min_p * max_prob
+    typical_p: float = 0.95      # typical sampling mass (1.0 disables)
     max_gen_tokens: int = 180
     min_gen_tokens: int = 16
     repetition_guard: int = 4
@@ -763,6 +766,82 @@ def top_k_top_p_sample(probs, k, p):
             return i
     return idx[-1]
 
+
+def _renorm_probs(probs):
+    s = sum(probs)
+    if s <= 0:
+        return probs
+    return [p / s for p in probs]
+
+def apply_min_p_filter(probs, min_p):
+    """Keep tokens with p >= min_p * max_p, renormalize."""
+    if min_p is None:
+        return probs
+    mp = float(min_p)
+    if mp <= 0:
+        return probs
+    max_p = max(probs) if probs else 0.0
+    if max_p <= 0:
+        return probs
+    thr = mp * max_p
+    out = [p if p >= thr else 0.0 for p in probs]
+    return _renorm_probs(out)
+
+def typical_indices(probs, typical_p):
+    """Return a list of token indices kept by typical sampling (mass typical_p)."""
+    tp = float(typical_p)
+    if tp >= 0.999 or tp <= 0:
+        return list(range(len(probs)))
+    # entropy
+    H = 0.0
+    for p in probs:
+        if p > 0:
+            H -= p * math.log(p + 1e-12)
+    # typicality = |surprisal - entropy|
+    items = []
+    for i, p in enumerate(probs):
+        if p <= 0:
+            continue
+        s = -math.log(p + 1e-12)
+        items.append((abs(s - H), i, p))
+    items.sort(key=lambda x: x[0])  # closer to entropy first
+    kept = []
+    cum = 0.0
+    for _, i, p in items:
+        kept.append(i)
+        cum += p
+        if cum >= tp:
+            break
+    return kept if kept else list(range(len(probs)))
+
+def sample_with_filters(probs, k, p, min_p=None, typical_p=1.0):
+    """Sampling pipeline: min_p -> typical -> top_k/top_p."""
+    probs = apply_min_p_filter(probs, min_p)
+    idx = typical_indices(probs, typical_p)
+    # apply top-k/top-p within idx
+    idx.sort(key=lambda i: probs[i], reverse=True)
+    if k and k > 0:
+        idx = idx[:min(k, len(idx))]
+    if p is not None and float(p) < 1.0:
+        cum = 0.0
+        cut = []
+        for i in idx:
+            cut.append(i)
+            cum += probs[i]
+            if cum >= float(p):
+                break
+        idx = cut
+    mass = sum(probs[i] for i in idx)
+    if mass <= 0:
+        return idx[0] if idx else (len(probs) - 1)
+    r = random.random() * mass
+    s = 0.0
+    for i in idx:
+        s += probs[i]
+        if s >= r:
+            return i
+    return idx[-1]
+
 def clip_params(params, clip):
     # And lo, the gradients shall be clipped, lest they summon Cthulhu.
     if clip <= 0:
@@ -1082,7 +1161,7 @@ class GPT:
             temp = base_temp * t_mul
             scaled = [v / temp for v in raw]
             probs = softmax_probs_float(scaled)
-            nxt = top_k_top_p_sample(probs, CFG.top_k, CFG.top_p)
+            nxt = sample_with_filters(probs, CFG.top_k, CFG.top_p, min_p=getattr(CFG,'min_p',0.0), typical_p=getattr(CFG,'typical_p',1.0))
 
             if nxt == self.tok.stoi[self.tok.EOS]:
                 if step >= CFG.min_gen_tokens:
