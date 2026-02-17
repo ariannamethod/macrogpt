@@ -85,6 +85,27 @@ class Config:
     # async
     train_tick_seconds: float = 0.25
 
+    # hybrid attention heads: "content", "rrpram", or "hybrid"
+    head_types: tuple = ("content", "content", "hybrid", "hybrid")
+    hybrid_alpha_init: float = 0.5
+
+    # gamma (personality fingerprint)
+    gamma_sparsity_threshold: float = 0.01
+
+    # entropy-adaptive temperature
+    entropy_low: float = 0.5
+    entropy_high: float = 1.5
+    entropy_temp_boost: float = 1.2
+    entropy_temp_focus: float = 0.8
+
+    # corpus field
+    corpus_gen_max_tokens: int = 120
+
+    # quantum buffer
+    qb_min_bytes: int = 1024
+    qb_min_novelty: float = 0.15
+    qb_cooldown_seconds: float = 60.0
+
 
 CFG = Config()
 
@@ -112,6 +133,21 @@ def init_db(db_path: str):
             note TEXT
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS growth(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            step INTEGER NOT NULL,
+            vocab_size INTEGER NOT NULL,
+            n_params INTEGER NOT NULL,
+            n_deltas INTEGER NOT NULL,
+            corpus_chars INTEGER NOT NULL,
+            loss REAL,
+            gamma_sparsity REAL,
+            gamma_magnitude REAL,
+            note TEXT
+        )
+    """)
     con.commit()
     return con
 
@@ -124,6 +160,34 @@ def db_recent_messages(con, limit: int = 32):
     cur = con.cursor()
     cur.execute("SELECT role, text FROM messages ORDER BY id DESC LIMIT ?", (limit,))
     return list(reversed(cur.fetchall()))
+
+def db_log_growth(con, model, tok, docs, loss_val=None, note=None):
+    # And lo, the organism shall write its own autobiography in numbers.
+    """Record a growth snapshot — structural biography."""
+    n_params = sum(len(r.data) for r in model.all_base_params())
+    n_params += sum(len(r.data) for r in model.all_delta_params())
+    corpus_chars = sum(len(d) for d in docs)
+    step = con.execute("SELECT COUNT(*) FROM growth").fetchone()[0]
+    g_sparsity, g_mag = None, None
+    if hasattr(model, 'gamma_stats'):
+        gs = model.gamma_stats()
+        g_sparsity = gs.get("sparsity")
+        g_mag = gs.get("magnitude")
+    con.execute(
+        "INSERT INTO growth(ts,step,vocab_size,n_params,n_deltas,corpus_chars,loss,gamma_sparsity,gamma_magnitude,note) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (time.time(), step, tok.vocab_size, n_params, len(model.deltas),
+         corpus_chars, loss_val, g_sparsity, g_mag, note))
+    con.commit()
+
+def db_describe_growth(con):
+    # And lo, the organism shall read its own growth chart and weep with pride.
+    """Return growth history for self-report."""
+    cur = con.cursor()
+    cur.execute("SELECT step,vocab_size,n_params,n_deltas,corpus_chars,loss,gamma_sparsity,gamma_magnitude,ts FROM growth ORDER BY id")
+    return [{"step": r[0], "vocab_size": r[1], "n_params": r[2], "n_deltas": r[3],
+             "corpus_chars": r[4], "loss": r[5], "gamma_sparsity": r[6],
+             "gamma_magnitude": r[7], "ts": r[8]} for r in cur.fetchall()]
 
 # ============================================================
 # 2) CORPUS RESERVOIR — and nonames.txt shall not bloat forever
@@ -239,6 +303,147 @@ def compute_new_corpus_mass(con, last_event_id):
         return 0, last_event_id
     mass = sum(r[1] for r in rows)
     return mass, rows[-1][0]
+
+# ============================================================
+# 2.5) CO-OCCURRENCE FIELD — corpus-level statistics for
+#       generation before (or alongside) trained weights
+# ============================================================
+
+class CooccurField:
+    # And lo, the corpus shall whisper its statistics, and words shall follow words.
+    """Lightweight bigram/trigram frequency model built from token IDs."""
+
+    def __init__(self):
+        self.unigram = Counter()
+        self.bigram = defaultdict(Counter)
+        self.trigram = defaultdict(Counter)
+        self.total_tokens = 0
+
+    def build_from_corpus(self, tok, docs):
+        self.unigram.clear()
+        self.bigram.clear()
+        self.trigram.clear()
+        self.total_tokens = 0
+        for doc in docs:
+            ids = tok.encode(doc)
+            for i, tid in enumerate(ids):
+                self.unigram[tid] += 1
+                self.total_tokens += 1
+                if i >= 1:
+                    self.bigram[ids[i - 1]][tid] += 1
+                if i >= 2:
+                    self.trigram[(ids[i - 2], ids[i - 1])][tid] += 1
+
+    def sample_next(self, context_ids, temperature=1.0):
+        """Trigram -> bigram -> unigram fallback sampling."""
+        dist = None
+        if len(context_ids) >= 2:
+            key = (context_ids[-2], context_ids[-1])
+            if key in self.trigram and self.trigram[key]:
+                dist = self.trigram[key]
+        if dist is None and len(context_ids) >= 1:
+            if context_ids[-1] in self.bigram and self.bigram[context_ids[-1]]:
+                dist = self.bigram[context_ids[-1]]
+        if dist is None:
+            dist = self.unigram
+        if not dist:
+            return 0
+        items = list(dist.items())
+        logits_raw = [math.log(max(c, 1e-10)) / max(temperature, 1e-6) for _, c in items]
+        probs = softmax_probs_float(logits_raw)
+        r = random.random()
+        cumsum = 0.0
+        for i, p in enumerate(probs):
+            cumsum += p
+            if cumsum >= r:
+                return items[i][0]
+        return items[-1][0]
+
+
+def corpus_generate(tok, field, seed_text, max_tokens=None):
+    # And lo, the organism shall speak before it learns, like a newborn crying.
+    """Generate text purely from corpus statistics (no model weights)."""
+    if max_tokens is None:
+        max_tokens = CFG.corpus_gen_max_tokens
+    ids = tok.encode(seed_text)[:-1]
+    out_ids = []
+    eos_id = tok.stoi.get(tok.EOS, -1)
+    for _ in range(max_tokens):
+        nxt = field.sample_next(ids)
+        if nxt == eos_id:
+            break
+        ids.append(nxt)
+        out_ids.append(nxt)
+    return tok.decode([tok.stoi[tok.BOS]] + out_ids + [eos_id])
+
+
+def generate_resonant(model, tok, field, prompt_text, use_model=True, model_alpha=0.5):
+    # And lo, the model and the corpus shall duet like two drunks harmonizing.
+    """Blend model logits with corpus field for generation."""
+    if not use_model:
+        return corpus_generate(tok, field, prompt_text)
+
+    ids = tok.encode(prompt_text)[:-1]
+    if not ids:
+        ids = [tok.stoi[tok.BOS]]
+    keys = [[] for _ in range(model.n_layer)]
+    values = [[] for _ in range(model.n_layer)]
+    for pos in range(min(len(ids), model.block_size)):
+        _ = model.forward_step(ids[pos], pos, keys, values)
+
+    cur = ids[-1]
+    out_ids = []
+    eos_id = tok.stoi.get(tok.EOS, -1)
+
+    for step in range(CFG.corpus_gen_max_tokens):
+        pos = min(len(ids) - 1, model.block_size - 1)
+        logits = model.forward_step(cur, pos, keys, values)
+        model_probs = softmax_probs_float([v / CFG.temperature for v in logits.data])
+
+        # corpus bias
+        corpus_dist = {}
+        if len(ids) >= 2:
+            key = (ids[-2], ids[-1])
+            if key in field.trigram:
+                corpus_dist = dict(field.trigram[key])
+        if not corpus_dist and len(ids) >= 1:
+            if ids[-1] in field.bigram:
+                corpus_dist = dict(field.bigram[ids[-1]])
+
+        if corpus_dist:
+            total_c = sum(corpus_dist.values())
+            corpus_probs = [0.0] * len(model_probs)
+            for tid, cnt in corpus_dist.items():
+                if tid < len(corpus_probs):
+                    corpus_probs[tid] = cnt / total_c
+            blended = [model_alpha * mp + (1.0 - model_alpha) * cp
+                       for mp, cp in zip(model_probs, corpus_probs)]
+            total_b = sum(blended)
+            if total_b > 0:
+                blended = [b / total_b for b in blended]
+            probs = blended
+        else:
+            probs = model_probs
+
+        nxt = top_k_top_p_sample(probs, CFG.top_k, CFG.top_p)
+        if nxt == eos_id and step >= CFG.min_gen_tokens:
+            break
+        if nxt == eos_id:
+            continue
+
+        ids.append(nxt)
+        cur = nxt
+        out_ids.append(nxt)
+
+        if len(ids) >= model.block_size:
+            ids = ids[-model.block_size:]
+            keys = [[] for _ in range(model.n_layer)]
+            values = [[] for _ in range(model.n_layer)]
+            for p in range(len(ids) - 1):
+                _ = model.forward_step(ids[p], p, keys, values)
+
+    return tok.decode([tok.stoi[tok.BOS]] + out_ids + [eos_id])
+
 
 # ============================================================
 # 3) TOKENIZER — char first, then BPE that only EXPANDS vocab
@@ -530,6 +735,16 @@ class VectorValue:
         def _back():
             for i, j in enumerate(range(start, end)):
                 self.grad[j] += out.grad[i]
+        out._back_fn = _back
+        return out
+
+    def element(self, idx):
+        # And lo, one number shall be plucked from the vector, and gradients shall follow.
+        """Extract single element as ScalarValue with gradient flow."""
+        out = ScalarValue(self.data[idx], (self,))
+        local_idx = idx
+        def _back():
+            self.grad[local_idx] += out.grad
         out._back_fn = _back
         return out
 
@@ -870,6 +1085,14 @@ class GPT:
             self.base[f"l{li}.fc_g"] = MatrixParam(4 * CFG.n_embd, CFG.n_embd, 0.08)
             self.base[f"l{li}.fc_v"] = MatrixParam(4 * CFG.n_embd, CFG.n_embd, 0.08)
             self.base[f"l{li}.fc2"]  = MatrixParam(CFG.n_embd, 4 * CFG.n_embd, 0.08)
+            # hybrid attention: RRPRAM pattern weights + learnable gate
+            for h, htype in enumerate(CFG.head_types):
+                if htype in ("rrpram", "hybrid"):
+                    self.base[f"l{li}.h{h}.w_pattern"] = MatrixParam(
+                        CFG.block_size, self.head_dim, 0.08)
+                if htype == "hybrid":
+                    self.base[f"l{li}.h{h}.alpha"] = MatrixParam(1, 1, 0.0)
+                    self.base[f"l{li}.h{h}.alpha"].rows[0].data[0] = CFG.hybrid_alpha_init
 
         # Modular deltas
         self.deltas = []
@@ -877,6 +1100,9 @@ class GPT:
 
         # Adam state
         self._adam = {}
+
+        # snapshot initial embeddings for gamma computation
+        self._init_embed_snapshot = [list(row.data) for row in self.base["wte"].rows]
 
         # ensure at least one delta module exists
         self.add_delta_module(alpha=1.0)
@@ -906,6 +1132,10 @@ class GPT:
             mod[f"l{li}.fc_g"] = DeltaAdapter(4 * CFG.n_embd, CFG.n_embd, r)
             mod[f"l{li}.fc_v"] = DeltaAdapter(4 * CFG.n_embd, CFG.n_embd, r)
             mod[f"l{li}.fc2"]  = DeltaAdapter(CFG.n_embd, 4 * CFG.n_embd, r)
+            for h, htype in enumerate(CFG.head_types):
+                if htype in ("rrpram", "hybrid"):
+                    mod[f"l{li}.h{h}.w_pattern"] = DeltaAdapter(
+                        CFG.block_size, self.head_dim, r)
 
         mod["lm_head"] = DeltaAdapter(self.tok.vocab_size, CFG.n_embd, r)
         self.deltas.append(mod)
@@ -923,6 +1153,61 @@ class GPT:
             for ad in mod.values():
                 out.extend(ad.params())
         return out
+
+    # ---- Native gamma (personality fingerprint) ----
+    # And lo, the organism shall subtract its birth from its present, and call the difference a soul.
+
+    def compute_gamma(self):
+        """Compute gamma = current_embed - init_embed (personality drift)."""
+        current = self.base["wte"].rows
+        init = self._init_embed_snapshot
+        gamma = []
+        for i in range(min(len(current), len(init))):
+            diff = [current[i].data[j] - init[i][j] for j in range(len(init[i]))]
+            gamma.append(diff)
+        for i in range(len(init), len(current)):
+            gamma.append(list(current[i].data))
+        return gamma
+
+    # And lo, the soul shall be measured in sparsity and magnitude, like a ghost on a scale.
+    def gamma_stats(self):
+        """Sparsity, magnitude, top changed tokens."""
+        gamma = self.compute_gamma()
+        if not gamma:
+            return {"sparsity": 1.0, "magnitude": 0.0, "top_tokens": [], "n_rows": 0}
+        magnitudes = []
+        for i, row in enumerate(gamma):
+            mag = math.sqrt(sum(v * v for v in row))
+            magnitudes.append((i, mag))
+        total_el = sum(len(row) for row in gamma)
+        nonzero = sum(1 for row in gamma for v in row
+                      if abs(v) > CFG.gamma_sparsity_threshold)
+        sparsity = 1.0 - (nonzero / max(1, total_el))
+        overall_mag = math.sqrt(sum(m * m for _, m in magnitudes))
+        magnitudes.sort(key=lambda x: x[1], reverse=True)
+        return {
+            "sparsity": sparsity,
+            "magnitude": overall_mag,
+            "top_tokens": [(tid, mag) for tid, mag in magnitudes[:10]],
+            "n_rows": len(gamma),
+        }
+
+    # And lo, the direction of all change shall be averaged into one arrow, pointing toward who we became.
+    def gamma_contrastive_projection(self):
+        """Direction of mean embedding drift — personality vector."""
+        current = self.base["wte"].rows
+        init = self._init_embed_snapshot
+        n = min(len(current), len(init))
+        if n == 0:
+            return None
+        dim = len(init[0])
+        mean_c = [sum(current[i].data[j] for i in range(n)) / n for j in range(dim)]
+        mean_i = [sum(init[i][j] for i in range(n)) / n for j in range(dim)]
+        direction = [mean_c[j] - mean_i[j] for j in range(dim)]
+        mag = math.sqrt(sum(v * v for v in direction))
+        if mag > 1e-10:
+            direction = [v / mag for v in direction]
+        return direction
 
     def _ensure_adam(self, params, key):
         if key not in self._adam:
@@ -982,25 +1267,46 @@ class GPT:
             values[li].append(v)
 
             head_outputs = []
+            # And lo, each head shall choose its nature: content, rrpram, or the sacred hybrid of both.
+            T = len(keys[li])
             for h in range(self.n_head):
                 hs = h * self.head_dim
                 he = hs + self.head_dim
+                htype = CFG.head_types[h] if h < len(CFG.head_types) else "content"
 
-                qh = q.slice(hs, he)
-                # RoPE on q
-                qh = rope_rotate(qh, pos_id, self.head_dim)
+                vh = [values[li][t].slice(hs, he) for t in range(T)]
 
-                attn_logits = []
-                for t in range(len(keys[li])):
-                    kh_t = keys[li][t].slice(hs, he)
-                    # RoPE on k at its own position t
-                    kh_t = rope_rotate(kh_t, t, self.head_dim)
-                    dot = qh.dot(kh_t) * (1.0 / math.sqrt(self.head_dim))
-                    attn_logits.append(dot)
+                # content attention (Q@K^T/sqrt(d) + RoPE)
+                content_logits = None
+                if htype in ("content", "hybrid"):
+                    qh = q.slice(hs, he)
+                    qh = rope_rotate(qh, pos_id, self.head_dim)
+                    content_logits = []
+                    for t in range(T):
+                        kh_t = keys[li][t].slice(hs, he)
+                        kh_t = rope_rotate(kh_t, t, self.head_dim)
+                        dot = qh.dot(kh_t) * (1.0 / math.sqrt(self.head_dim))
+                        content_logits.append(dot)
 
-                attn_weights = scalar_softmax(attn_logits)
+                # RRPRAM attention (x @ W_pattern -> positional scores)
+                rrpram_logits = None
+                if htype in ("rrpram", "hybrid"):
+                    xh = x.slice(hs, he)
+                    pattern_full = self._apply_with_deltas(f"l{li}.h{h}.w_pattern", xh)
+                    rrpram_logits = [pattern_full.element(t) for t in range(T)]
 
-                vh = [values[li][t].slice(hs, he) for t in range(len(values[li]))]
+                # dispatch by head type
+                if htype == "content":
+                    attn_weights = scalar_softmax(content_logits)
+                elif htype == "rrpram":
+                    attn_weights = scalar_softmax(rrpram_logits)
+                else:  # hybrid: blend with sigmoid gate
+                    alpha_raw = self.base[f"l{li}.h{h}.alpha"].rows[0].data[0]
+                    a = 1.0 / (1.0 + math.exp(-alpha_raw))
+                    blended = [c * (1.0 - a) + r * a
+                               for c, r in zip(content_logits, rrpram_logits)]
+                    attn_weights = scalar_softmax(blended)
+
                 head_out = attention_weighted_sum(attn_weights, vh)
                 head_outputs.append(head_out)
 
@@ -1068,20 +1374,19 @@ class GPT:
             pos = min(len(ids) - 1, self.block_size - 1)
             logits = self.forward_step(cur, pos, keys, values)
 
-            # small "gpt-ish" stability trick: adapt temperature slightly to confidence
+            # entropy-adaptive temperature
             base_temp = float(CFG.temperature)
             if base_temp <= 1e-6:
                 base_temp = 1e-6
             raw = logits.data
             raw_scaled = [v / base_temp for v in raw]
             probs0 = softmax_probs_float(raw_scaled)
-            maxp = max(probs0) if probs0 else 0.0
-            # if too peaky -> loosen; if too flat -> tighten
+            entropy = -sum(p * math.log(p) for p in probs0 if p > 1e-12)
             t_mul = 1.0
-            if maxp > 0.60:
-                t_mul = 1.10
-            elif maxp < 0.15:
-                t_mul = 0.90
+            if entropy < CFG.entropy_low:
+                t_mul = CFG.entropy_temp_boost
+            elif entropy > CFG.entropy_high:
+                t_mul = CFG.entropy_temp_focus
             temp = base_temp * t_mul
             scaled = [v / temp for v in raw]
             probs = softmax_probs_float(scaled)
@@ -1146,6 +1451,7 @@ def save_checkpoint(model: GPT, tok: EvolvingTokenizer, path=None):
         },
         "base": {k: _serialize_matrix_param(v) for k, v in model.base.items()},
         "alpha": model.active_alpha,
+        "init_embed_snapshot": model._init_embed_snapshot,
         "deltas": []
     }
     for mod in model.deltas:
@@ -1187,6 +1493,17 @@ def load_checkpoint(docs, path=None):
     # Restore base
     model.base = {k: _deserialize_matrix_param(v) for k, v in obj["base"].items()}
 
+    # Ensure hybrid attention weights exist (backward compat with old checkpoints)
+    for li in range(CFG.n_layer):
+        for h, htype in enumerate(CFG.head_types):
+            pkey = f"l{li}.h{h}.w_pattern"
+            akey = f"l{li}.h{h}.alpha"
+            if htype in ("rrpram", "hybrid") and pkey not in model.base:
+                model.base[pkey] = MatrixParam(CFG.block_size, model.head_dim, 0.08)
+            if htype == "hybrid" and akey not in model.base:
+                model.base[akey] = MatrixParam(1, 1, 0.0)
+                model.base[akey].rows[0].data[0] = CFG.hybrid_alpha_init
+
     # Restore deltas
     model.deltas = []
     model.active_alpha = obj.get("alpha", [])
@@ -1201,6 +1518,13 @@ def load_checkpoint(docs, path=None):
 
     if not model.deltas:
         model.add_delta_module(alpha=1.0)
+
+    # Restore gamma baseline (or initialize from current if old checkpoint)
+    snapshot = obj.get("init_embed_snapshot")
+    if snapshot:
+        model._init_embed_snapshot = snapshot
+    else:
+        model._init_embed_snapshot = [list(row.data) for row in model.base["wte"].rows]
 
     return model, tok
 
@@ -1232,10 +1556,47 @@ def train_steps(model: GPT, tok: EvolvingTokenizer, docs, steps, train_base=True
         if step % 100 == 0:
             print(f"  train step {step}/{steps} | loss {loss.data:.4f}")
 
+# And lo, the buffer shall measure not just bytes but novelty, for raw mass means nothing without surprise.
+class QuantumBuffer:
+    """Smart training trigger: accumulates experience, fires when ready."""
+    def __init__(self):
+        self.accumulated_bytes = 0
+        self.unique_tokens = set()
+        self.total_tokens = 0
+        self.last_burst_time = 0.0
+
+    def feed(self, new_chars, tok, docs):
+        self.accumulated_bytes += new_chars
+        for doc in docs[-20:]:
+            ids = tok.encode(doc)
+            for tid in ids:
+                self.total_tokens += 1
+                self.unique_tokens.add(tid)
+
+    def novelty_score(self):
+        if self.total_tokens == 0:
+            return 0.0
+        return len(self.unique_tokens) / max(1, self.total_tokens)
+
+    def should_trigger(self):
+        now = time.time()
+        cooldown_ok = (now - self.last_burst_time) >= CFG.qb_cooldown_seconds
+        bytes_ok = self.accumulated_bytes >= CFG.qb_min_bytes
+        novelty_ok = self.novelty_score() >= CFG.qb_min_novelty
+        return (bytes_ok or novelty_ok) and cooldown_ok
+
+    def reset(self):
+        self.accumulated_bytes = 0
+        self.unique_tokens.clear()
+        self.total_tokens = 0
+        self.last_burst_time = time.time()
+
+
 async def background_trainer(con, model: GPT, tok: EvolvingTokenizer):
     # And lo, asynchronous training shall occur, because sleeping is for humans.
     last_event_id = 0
     warmed_up = False
+    qbuf = QuantumBuffer()
 
     while True:
         _ = update_reservoir_corpus(con, CFG.corpus_path, CFG.max_corpus_lines)
@@ -1255,21 +1616,27 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer):
             train_steps(model, tok, docs, CFG.warmup_steps,
                         train_base=True, train_deltas=True)
             save_checkpoint(model, tok)
+            db_log_growth(con, model, tok, docs, note="warmup_complete")
             warmed_up = True
             print("[trainer] warmup complete. base may freeze now, like a proud fossil.")
 
-        if warmed_up and mass >= CFG.min_new_chars_to_train and docs:
-            print(f"[trainer] micro-train burst ({mass} new chars) — and lo, it feeds again.")
-            train_base = not CFG.freeze_base_after_warmup
-            train_steps(model, tok, docs, CFG.micro_steps,
-                        train_base=train_base, train_deltas=True)
-            save_checkpoint(model, tok)
-
-            # occasionally grow a new delta module
-            if len(model.deltas) < CFG.max_delta_modules and random.random() < CFG.delta_grow_prob:
-                print(f"[trainer] growing new delta module (total: {len(model.deltas)+1}) — new soul appended.")
-                model.add_delta_module(alpha=1.0)
+        if warmed_up and docs:
+            qbuf.feed(mass, tok, docs)
+            if qbuf.should_trigger():
+                nov = qbuf.novelty_score()
+                print(f"[trainer] quantum burst (bytes={qbuf.accumulated_bytes}, novelty={nov:.3f})")
+                train_base = not CFG.freeze_base_after_warmup
+                train_steps(model, tok, docs, CFG.micro_steps,
+                            train_base=train_base, train_deltas=True)
                 save_checkpoint(model, tok)
+                db_log_growth(con, model, tok, docs, note="quantum_burst")
+                qbuf.reset()
+
+                # occasionally grow a new delta module
+                if len(model.deltas) < CFG.max_delta_modules and random.random() < CFG.delta_grow_prob:
+                    print(f"[trainer] growing new delta module (total: {len(model.deltas)+1})")
+                    model.add_delta_module(alpha=1.0)
+                    save_checkpoint(model, tok)
 
         await asyncio.sleep(CFG.train_tick_seconds)
 
