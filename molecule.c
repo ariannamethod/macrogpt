@@ -69,6 +69,9 @@ typedef struct {
     /* gamma */
     double gamma_sparsity_threshold;
 
+    /* noise immune system */
+    double noise_drift_threshold;
+
     /* entropy temperature */
     double entropy_low, entropy_high;
     double entropy_temp_boost, entropy_temp_focus;
@@ -119,6 +122,7 @@ static Config CFG = {
     .n_head_types = 4,
     .hybrid_alpha_init = 0.5,
     .gamma_sparsity_threshold = 0.01,
+    .noise_drift_threshold = -0.1,
     .entropy_low = 0.5, .entropy_high = 1.5,
     .entropy_temp_boost = 1.2, .entropy_temp_focus = 0.8,
     .corpus_gen_max_tokens = 120,
@@ -1772,6 +1776,107 @@ static GammaStats gpt_gamma_stats(GPT *g) {
     return gs;
 }
 
+/* ---- Noise Immune System ---- */
+/* And lo, the organism shall know poison from food, and reject what unmakes it. */
+
+typedef struct {
+    double **A_data;  /* [nout][nin_a] */
+    double **B_data;  /* [nout_b][nin_b] */
+    int A_nout, A_nin, B_nout, B_nin;
+} AdapterSnap;
+
+typedef struct {
+    AdapterSnap *adapters;
+    int count;
+} DeltaSnap;
+
+typedef struct {
+    DeltaSnap *modules;
+    int n_modules;
+} ImmuneSnapshot;
+
+static ImmuneSnapshot gpt_snapshot_deltas(GPT *g) {
+    ImmuneSnapshot snap;
+    snap.n_modules = g->n_deltas;
+    snap.modules = calloc(g->n_deltas, sizeof(DeltaSnap));
+    for (int d = 0; d < g->n_deltas; d++) {
+        DeltaModule *mod = g->deltas[d];
+        snap.modules[d].count = mod->count;
+        snap.modules[d].adapters = calloc(mod->count, sizeof(AdapterSnap));
+        for (int a = 0; a < mod->count; a++) {
+            DeltaAdapter *da = mod->adapters[a];
+            AdapterSnap *as = &snap.modules[d].adapters[a];
+            as->A_nout = da->A->nout; as->A_nin = da->A->nin;
+            as->B_nout = da->B->nout; as->B_nin = da->B->nin;
+            as->A_data = calloc(da->A->nout, sizeof(double*));
+            for (int i = 0; i < da->A->nout; i++) {
+                as->A_data[i] = malloc(sizeof(double) * da->A->nin);
+                memcpy(as->A_data[i], da->A->row_data[i], sizeof(double) * da->A->nin);
+            }
+            as->B_data = calloc(da->B->nout, sizeof(double*));
+            for (int i = 0; i < da->B->nout; i++) {
+                as->B_data[i] = malloc(sizeof(double) * da->B->nin);
+                memcpy(as->B_data[i], da->B->row_data[i], sizeof(double) * da->B->nin);
+            }
+        }
+    }
+    return snap;
+}
+
+static void gpt_restore_deltas(GPT *g, ImmuneSnapshot *snap) {
+    for (int d = 0; d < snap->n_modules && d < g->n_deltas; d++) {
+        DeltaModule *mod = g->deltas[d];
+        for (int a = 0; a < snap->modules[d].count && a < mod->count; a++) {
+            DeltaAdapter *da = mod->adapters[a];
+            AdapterSnap *as = &snap->modules[d].adapters[a];
+            for (int i = 0; i < as->A_nout && i < da->A->nout; i++)
+                memcpy(da->A->row_data[i], as->A_data[i], sizeof(double) * da->A->nin);
+            for (int i = 0; i < as->B_nout && i < da->B->nout; i++)
+                memcpy(da->B->row_data[i], as->B_data[i], sizeof(double) * da->B->nin);
+        }
+    }
+}
+
+static void immune_snap_free(ImmuneSnapshot *snap) {
+    for (int d = 0; d < snap->n_modules; d++) {
+        for (int a = 0; a < snap->modules[d].count; a++) {
+            AdapterSnap *as = &snap->modules[d].adapters[a];
+            for (int i = 0; i < as->A_nout; i++) free(as->A_data[i]);
+            for (int i = 0; i < as->B_nout; i++) free(as->B_data[i]);
+            free(as->A_data); free(as->B_data);
+        }
+        free(snap->modules[d].adapters);
+    }
+    free(snap->modules);
+}
+
+/* Contrastive projection: mean direction of embedding drift, normalized */
+static double *gpt_contrastive_projection(GPT *g, int *out_dim) {
+    MatrixParam *wte = gpt_base(g, "wte");
+    if (!wte || !g->init_embed_snapshot) { *out_dim = 0; return NULL; }
+    int n = wte->nout < g->init_embed_rows ? wte->nout : g->init_embed_rows;
+    int dim = wte->nin;
+    *out_dim = dim;
+    double *dir = calloc(dim, sizeof(double));
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < dim; j++)
+            dir[j] += wte->row_data[i][j] - g->init_embed_snapshot[i][j];
+    double mag = 0;
+    for (int j = 0; j < dim; j++) mag += dir[j] * dir[j];
+    mag = sqrt(mag);
+    if (mag > 1e-12)
+        for (int j = 0; j < dim; j++) dir[j] /= mag;
+    return dir;
+}
+
+/* Cosine similarity between pre/post contrastive projection. Negative = noise. */
+static double gpt_drift_check(double *pre, double *post, int dim) {
+    if (!pre || !post) return 1.0;
+    double dot = 0;
+    for (int i = 0; i < dim; i++) dot += pre[i] * post[i];
+    return dot;
+}
+
 static void db_log_growth(sqlite3 *db, GPT *g, EvolvingTokenizer *tok,
                           StrArr *docs, double loss_val, const char *note) {
     int n_params = 0;
@@ -2157,10 +2262,29 @@ static void *background_trainer(void *arg) {
             qb_snapshot(ctx->qbuf, &snap_bytes, &snap_novelty);
             printf("[trainer] micro-train burst (%d bytes, novelty %.2f) — and lo, it feeds again.\n",
                    snap_bytes, snap_novelty);
+
+            /* IMMUNE SYSTEM: snapshot before burst */
+            int pre_dim;
+            double *pre_direction = gpt_contrastive_projection(ctx->model, &pre_dim);
+            ImmuneSnapshot delta_snap = gpt_snapshot_deltas(ctx->model);
+
             int train_base = !CFG.freeze_base_after_warmup;
             train_steps(ctx->model, ctx->tok, &docs, CFG.micro_steps, train_base, 1);
-            save_checkpoint(ctx->model, ctx->tok, NULL);
-            db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, 0.0, "micro_burst");
+
+            /* IMMUNE SYSTEM: check drift after burst */
+            int post_dim;
+            double *post_direction = gpt_contrastive_projection(ctx->model, &post_dim);
+            double drift_cos = gpt_drift_check(pre_direction, post_direction, pre_dim);
+            if (drift_cos < CFG.noise_drift_threshold) {
+                printf("[immune] NOISE DETECTED (drift cosine=%.3f). Rolling back deltas.\n", drift_cos);
+                gpt_restore_deltas(ctx->model, &delta_snap);
+                db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, 0.0, "noise_rejected");
+            } else {
+                save_checkpoint(ctx->model, ctx->tok, NULL);
+                db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, 0.0, "micro_burst");
+            }
+            free(pre_direction); free(post_direction);
+            immune_snap_free(&delta_snap);
             qb_reset(ctx->qbuf);
 
             if (ctx->model->n_deltas < CFG.max_delta_modules &&

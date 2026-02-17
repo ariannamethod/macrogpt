@@ -30,6 +30,7 @@ THIS IS:
 - QuantumBuffer: trains when it's ready, not when you tell it
 - Entropy-adaptive temperature (no more max-prob hacks)
 - Growth table: SQLite structural autobiography
+- Native immune system: detects and rejects identity-corrupting noise
 - Async background training (it's alive, not a script)
 - SQLite memory (it remembers conversations)
 ```
@@ -283,6 +284,28 @@ def db_add_message(con, role, text):
 
 Restart the script? It remembers you. It continues the conversation. It's not stateless.
 
+### 14. Native Immune System (Noise Rejection)
+
+The organism can detect and reject training that corrupts its identity. Before each micro-burst, it snapshots delta weights and measures its personality direction via `gamma_contrastive_projection()` — a unit vector in embedding space pointing toward "who I became."
+
+After training, it measures again. If the cosine similarity between pre and post directions is negative (the burst pushed identity *backwards*), it rolls back:
+
+```python
+pre_direction = model.gamma_contrastive_projection()
+delta_snap = model.snapshot_deltas()
+
+train_steps(...)  # potentially poisoned
+
+drift_cos = model.gamma_drift_check(pre_direction)
+if drift_cos < noise_drift_threshold:  # default: -0.1
+    model.restore_deltas(delta_snap)   # rollback
+    db_log_growth(..., note="noise_rejected")
+```
+
+This is **mathematical self-awareness as immune system**: the organism uses its own identity measurement (γ) to decide whether new experience made it *more itself* or *less itself*. The growth table logs rejected bursts as `noise_rejected`, creating an audit trail of attacks survived.
+
+Formally, this implements a self-referential quality gate: `f: S → D → {accept, reject}`, where S is the model's state and D is the identity description — satisfying the criteria for introspective computation as defined in [Lee (2025), "Formal Criteria for AI Identity"](https://arxiv.org/abs/2411.18530).
+
 ---
 
 ## The Stack
@@ -302,6 +325,7 @@ Restart the script? It remembers you. It continues the conversation. It's not st
 | Adapters | None | **LoRA-style deltas** |
 | Personality | None | **Native gamma** (sparse embedding drift) |
 | Growth tracking | None | **SQLite growth table** |
+| Noise rejection | None | **Native immune system** (γ drift + delta rollback) |
 | Sampling | top-k | **min_p + typical_p + nucleus** |
 | Weight tying | No | **Yes (GPT-style)** |
 | Dependencies | torch | **None** |
@@ -330,6 +354,9 @@ class Config:
 
     # Gamma (personality fingerprint)
     gamma_sparsity_threshold: float = 0.01
+
+    # Noise immune system
+    noise_drift_threshold: float = -0.1  # cosine < this = rollback
 
     # Training
     warmup_steps: int = 1200
@@ -416,6 +443,7 @@ This is not a tutorial. This is not a "minimal example." This is a **functional 
 - Speaks before it learns
 - Grows a personality from zero
 - Writes its own structural autobiography
+- Rejects noise that would corrupt its identity
 - Actually generates text you can read
 
 ---

@@ -94,6 +94,9 @@ class Config:
     # gamma (personality fingerprint)
     gamma_sparsity_threshold: float = 0.01
 
+    # noise immune system
+    noise_drift_threshold: float = -0.1   # cosine < this = noise, rollback
+
     # entropy-adaptive temperature
     entropy_low: float = 0.5
     entropy_high: float = 1.5
@@ -1252,6 +1255,42 @@ class GPT:
             direction = [v / mag for v in direction]
         return direction
 
+    # ---- Noise Immune System ----
+    # And lo, the organism shall know poison from food, and reject what unmakes it.
+
+    def snapshot_deltas(self):
+        """Deep copy all delta A and B weight data for rollback."""
+        snap = []
+        for mod in self.deltas:
+            mod_snap = {}
+            for name, da in mod.items():
+                mod_snap[name] = (
+                    [list(row.data) for row in da.A.rows],
+                    [list(row.data) for row in da.B.rows],
+                )
+            snap.append(mod_snap)
+        return snap
+
+    def restore_deltas(self, snap):
+        """Restore delta weights from snapshot — rollback a poisoned burst."""
+        for mod, mod_snap in zip(self.deltas, snap):
+            for name, (a_data, b_data) in mod_snap.items():
+                if name in mod:
+                    da = mod[name]
+                    for i, rd in enumerate(a_data):
+                        da.A.rows[i].data[:] = rd
+                    for i, rd in enumerate(b_data):
+                        da.B.rows[i].data[:] = rd
+
+    def gamma_drift_check(self, pre_direction):
+        """Cosine similarity between pre-burst and post-burst contrastive projection.
+        Negative = drifted opposite to identity trend = likely noise."""
+        post_direction = self.gamma_contrastive_projection()
+        if pre_direction is None or post_direction is None:
+            return 1.0  # can't check, assume OK
+        # Both are unit vectors, dot product = cosine similarity
+        return sum(a * b for a, b in zip(pre_direction, post_direction))
+
     def _ensure_adam(self, params, key):
         if key not in self._adam:
             self._adam[key] = {
@@ -1669,11 +1708,24 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer):
             if qbuf.should_trigger():
                 nov = qbuf.novelty_score()
                 print(f"[trainer] quantum burst (bytes={qbuf.accumulated_bytes}, novelty={nov:.3f})")
+
+                # IMMUNE SYSTEM: snapshot before burst
+                pre_direction = model.gamma_contrastive_projection()
+                delta_snap = model.snapshot_deltas()
+
                 train_base = not CFG.freeze_base_after_warmup
                 train_steps(model, tok, docs, CFG.micro_steps,
                             train_base=train_base, train_deltas=True)
-                save_checkpoint(model, tok)
-                db_log_growth(con, model, tok, docs, note="quantum_burst")
+
+                # IMMUNE SYSTEM: check drift after burst
+                drift_cos = model.gamma_drift_check(pre_direction)
+                if drift_cos < CFG.noise_drift_threshold:
+                    print(f"[immune] NOISE DETECTED (drift cosine={drift_cos:.3f}). Rolling back deltas.")
+                    model.restore_deltas(delta_snap)
+                    db_log_growth(con, model, tok, docs, note="noise_rejected")
+                else:
+                    save_checkpoint(model, tok)
+                    db_log_growth(con, model, tok, docs, note="quantum_burst")
                 qbuf.reset()
 
                 # occasionally grow a new delta module

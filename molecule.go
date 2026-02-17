@@ -85,6 +85,9 @@ type Config struct {
 	// gamma (personality fingerprint)
 	GammaSparsityThreshold float64 `json:"gamma_sparsity_threshold"`
 
+	// noise immune system
+	NoiseDriftThreshold float64 `json:"noise_drift_threshold"`
+
 	// entropy-adaptive temperature
 	EntropyLow       float64 `json:"entropy_low"`
 	EntropyHigh      float64 `json:"entropy_high"`
@@ -139,6 +142,7 @@ var CFG = Config{
 	HeadTypes:              []string{"content", "content", "hybrid", "hybrid"},
 	HybridAlphaInit:        0.5,
 	GammaSparsityThreshold: 0.01,
+	NoiseDriftThreshold:    -0.1,
 	EntropyLow:             0.5,
 	EntropyHigh:            1.5,
 	EntropyTempBoost:       1.2,
@@ -1490,6 +1494,74 @@ func (gpt *GPT) GammaContrastiveProjection() []float64 {
 	return direction
 }
 
+// ---- Noise Immune System ----
+// And lo, the organism shall know poison from food, and reject what unmakes it.
+
+// SnapshotDeltas deep-copies all delta A and B weight data for rollback.
+func (gpt *GPT) SnapshotDeltas() [][][2][][]float64 {
+	snap := make([][][2][][]float64, len(gpt.Deltas))
+	for di, mod := range gpt.Deltas {
+		modSnap := make([][2][][]float64, 0, len(mod))
+		for _, da := range mod {
+			var pair [2][][]float64
+			pair[0] = make([][]float64, da.A.Nout)
+			for i, row := range da.A.Rows {
+				pair[0][i] = make([]float64, len(row.Data))
+				copy(pair[0][i], row.Data)
+			}
+			pair[1] = make([][]float64, da.B.Nout)
+			for i, row := range da.B.Rows {
+				pair[1][i] = make([]float64, len(row.Data))
+				copy(pair[1][i], row.Data)
+			}
+			modSnap = append(modSnap, pair)
+		}
+		snap[di] = modSnap
+	}
+	return snap
+}
+
+// RestoreDeltas restores delta weights from snapshot — rollback a poisoned burst.
+func (gpt *GPT) RestoreDeltas(snap [][][2][][]float64) {
+	for di, mod := range gpt.Deltas {
+		if di >= len(snap) {
+			break
+		}
+		ai := 0
+		for _, da := range mod {
+			if ai >= len(snap[di]) {
+				break
+			}
+			pair := snap[di][ai]
+			for i, rd := range pair[0] {
+				if i < da.A.Nout {
+					copy(da.A.Rows[i].Data, rd)
+				}
+			}
+			for i, rd := range pair[1] {
+				if i < da.B.Nout {
+					copy(da.B.Rows[i].Data, rd)
+				}
+			}
+			ai++
+		}
+	}
+}
+
+// GammaDriftCheck returns cosine similarity between pre-burst and current contrastive projection.
+// Negative = drifted opposite to identity trend = likely noise.
+func (gpt *GPT) GammaDriftCheck(preDirection []float64) float64 {
+	postDirection := gpt.GammaContrastiveProjection()
+	if preDirection == nil || postDirection == nil {
+		return 1.0 // can't check, assume OK
+	}
+	dot := 0.0
+	for i := 0; i < len(preDirection) && i < len(postDirection); i++ {
+		dot += preDirection[i] * postDirection[i]
+	}
+	return dot // both unit vectors, dot = cosine
+}
+
 func (gpt *GPT) ensureAdam(params []*Vec, key string) {
 	if _, ok := gpt.Adam[key]; !ok {
 		m := make([][]float64, len(params))
@@ -2734,10 +2806,24 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 			snapBytes, snapNovelty := qbuf.SnapshotStats()
 			fmt.Printf("[trainer] micro-train burst (%d bytes, novelty %.2f) — and lo, it feeds again.\n",
 				snapBytes, snapNovelty)
+
+			// IMMUNE SYSTEM: snapshot before burst
+			preDirection := model.GammaContrastiveProjection()
+			deltaSnap := model.SnapshotDeltas()
+
 			trainBase := !CFG.FreezeBaseAfterWarm
 			trainSteps(model, tok, docs, CFG.MicroSteps, trainBase, true)
-			SaveCheckpoint(model, tok, "")
-			dbLogGrowth(db, model, tok, docs, 0.0, "micro_burst")
+
+			// IMMUNE SYSTEM: check drift after burst
+			driftCos := model.GammaDriftCheck(preDirection)
+			if driftCos < CFG.NoiseDriftThreshold {
+				fmt.Printf("[immune] NOISE DETECTED (drift cosine=%.3f). Rolling back deltas.\n", driftCos)
+				model.RestoreDeltas(deltaSnap)
+				dbLogGrowth(db, model, tok, docs, 0.0, "noise_rejected")
+			} else {
+				SaveCheckpoint(model, tok, "")
+				dbLogGrowth(db, model, tok, docs, 0.0, "micro_burst")
+			}
 			qbuf.Reset()
 
 			if len(model.Deltas) < CFG.MaxDeltaModules && rand.Float64() < CFG.DeltaGrowProb {
