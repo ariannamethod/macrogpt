@@ -26,7 +26,7 @@ THIS IS:
 - Async background training (it's alive, not a script)
 - min_p + typical_p sampling (full modern stack)
 - SQLite memory (it remembers conversations)
-- 1433 lines of pure madness
+- 1433 lines 
 ```
 
 ---
