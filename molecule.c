@@ -45,6 +45,7 @@ typedef struct {
     double beta1, beta2, eps_adam;
     double grad_clip;
     int freeze_base_after_warmup;
+    int batch_size;
 
     int delta_rank;
     int max_delta_modules;
@@ -75,6 +76,7 @@ typedef struct {
 
     /* noise immune system */
     double noise_drift_threshold;
+    double gamma_min_magnitude;   /* skip immune check when gamma direction is near-zero */
 
     /* entropy temperature */
     double entropy_low, entropy_high;
@@ -107,6 +109,7 @@ static Config CFG = {
     .beta1 = 0.9, .beta2 = 0.99, .eps_adam = 1e-8,
     .grad_clip = 1.0,
     .freeze_base_after_warmup = 1,
+    .batch_size = 4,
     .delta_rank = 8,
     .max_delta_modules = 12,
     .delta_grow_prob = 0.08,
@@ -127,6 +130,7 @@ static Config CFG = {
     .hybrid_alpha_init = 0.5,
     .gamma_sparsity_threshold = 0.01,
     .noise_drift_threshold = -0.1,
+    .gamma_min_magnitude = 1e-6,
     .entropy_low = 0.5, .entropy_high = 1.5,
     .entropy_temp_boost = 1.2, .entropy_temp_focus = 0.8,
     .corpus_gen_max_tokens = 120,
@@ -1025,18 +1029,6 @@ static Node *delta_apply(DeltaAdapter *d, Node *x) {
 
 typedef struct { char a[64]; char b[64]; } MergePair;
 
-typedef struct {
-    char **tokens;
-    int vocab_size;
-    int stoi[65536]; /* hash table: token string hash -> index (simplified) */
-    int bpe_enabled;
-    MergePair *merges;
-    int n_merges;
-    int trained_chars;
-
-    int bos_id, eos_id, pad_id;
-} Tokenizer;
-
 /* Simple string hash */
 static unsigned int str_hash(const char *s) {
     unsigned int h = 5381;
@@ -1137,6 +1129,204 @@ static void tok_add_token(EvolvingTokenizer *tok, const char *s) {
     tok->vocab_size++;
 }
 
+/* ---- BPE Training and Application ---- */
+
+/* Pair frequency counting hash table */
+#define PAIR_CAP 16384
+typedef struct { char a[64]; char b[64]; int count; int used; } PairEntry;
+
+static unsigned int pair_hash(const char *a, const char *b) {
+    unsigned int h = 5381;
+    for (const char *p = a; *p; p++) h = h * 33 + (unsigned char)*p;
+    h = h * 33 + 0xFF;
+    for (const char *p = b; *p; p++) h = h * 33 + (unsigned char)*p;
+    return h;
+}
+
+static void tok_train_bpe(EvolvingTokenizer *tok, const char **docs, int n_docs, int num_merges) {
+    /* Build word list from docs */
+    StrArr words = {0};
+    for (int d = 0; d < n_docs; d++) {
+        const char *p = docs[d];
+        while (*p) {
+            while (*p == ' ') p++;
+            if (!*p) break;
+            const char *start = p;
+            while (*p && *p != ' ') p++;
+            int wlen = (int)(p - start);
+            if (wlen > 0 && wlen < 200) {
+                char *w = malloc(wlen + 1);
+                memcpy(w, start, wlen); w[wlen] = 0;
+                sa_push(&words, w);
+                free(w);
+            }
+        }
+    }
+    if (words.len == 0) { sa_free(&words); return; }
+
+    /* Build symbol sequences per word: each char + </w> marker.
+     * Represent as StrArr per word, stored flat with sentinel. */
+    int total_words = words.len;
+
+    /* Use arrays of StrArr for symbol sequences */
+    StrArr *sym_seqs = calloc(total_words, sizeof(StrArr));
+    int *word_freq = calloc(total_words, sizeof(int));
+    for (int w = 0; w < total_words; w++) {
+        word_freq[w] = 1;
+        for (const char *p = words.items[w]; *p; p++) {
+            char cs[2] = {*p, 0};
+            sa_push(&sym_seqs[w], cs);
+        }
+        sa_push(&sym_seqs[w], "</w>");
+    }
+
+    /* Allocate merge storage */
+    if (tok->merges) free(tok->merges);
+    tok->merges = calloc(num_merges, sizeof(MergePair));
+    tok->n_merges = 0;
+
+    PairEntry *pairs = calloc(PAIR_CAP, sizeof(PairEntry));
+
+    for (int iter = 0; iter < num_merges; iter++) {
+        /* Count pairs */
+        memset(pairs, 0, sizeof(PairEntry) * PAIR_CAP);
+        for (int w = 0; w < total_words; w++) {
+            StrArr *seq = &sym_seqs[w];
+            for (int i = 0; i < seq->len - 1; i++) {
+                unsigned int h = pair_hash(seq->items[i], seq->items[i+1]) % PAIR_CAP;
+                for (int probe = 0; probe < PAIR_CAP; probe++) {
+                    int idx = (h + probe) % PAIR_CAP;
+                    if (!pairs[idx].used) {
+                        strncpy(pairs[idx].a, seq->items[i], 63);
+                        strncpy(pairs[idx].b, seq->items[i+1], 63);
+                        pairs[idx].count = word_freq[w];
+                        pairs[idx].used = 1;
+                        break;
+                    }
+                    if (strcmp(pairs[idx].a, seq->items[i]) == 0 &&
+                        strcmp(pairs[idx].b, seq->items[i+1]) == 0) {
+                        pairs[idx].count += word_freq[w];
+                        break;
+                    }
+                }
+            }
+        }
+
+        /* Find best pair */
+        int best_count = 0;
+        int best_idx = -1;
+        for (int i = 0; i < PAIR_CAP; i++) {
+            if (pairs[i].used && pairs[i].count > best_count) {
+                best_count = pairs[i].count;
+                best_idx = i;
+            }
+        }
+        if (best_idx < 0) break;
+
+        char best_a[64], best_b[64];
+        strncpy(best_a, pairs[best_idx].a, 63); best_a[63] = 0;
+        strncpy(best_b, pairs[best_idx].b, 63); best_b[63] = 0;
+
+        char new_tok[128];
+        snprintf(new_tok, sizeof(new_tok), "%s%s", best_a, best_b);
+
+        strncpy(tok->merges[tok->n_merges].a, best_a, 63);
+        strncpy(tok->merges[tok->n_merges].b, best_b, 63);
+        tok->n_merges++;
+
+        /* Apply merge to all symbol sequences */
+        for (int w = 0; w < total_words; w++) {
+            StrArr *seq = &sym_seqs[w];
+            StrArr merged = {0};
+            int i = 0;
+            while (i < seq->len) {
+                if (i < seq->len - 1 &&
+                    strcmp(seq->items[i], best_a) == 0 &&
+                    strcmp(seq->items[i+1], best_b) == 0) {
+                    sa_push(&merged, new_tok);
+                    i += 2;
+                } else {
+                    sa_push(&merged, seq->items[i]);
+                    i++;
+                }
+            }
+            sa_free(seq);
+            *seq = merged;
+        }
+
+        /* Add token to vocab if new */
+        tok_add_token(tok, new_tok);
+    }
+
+    free(pairs);
+    for (int w = 0; w < total_words; w++) sa_free(&sym_seqs[w]);
+    free(sym_seqs);
+    free(word_freq);
+    sa_free(&words);
+}
+
+/* Apply BPE merges to a word, returning symbol array */
+static StrArr tok_apply_bpe_to_word(EvolvingTokenizer *tok, const char *word) {
+    StrArr symbols = {0};
+    for (const char *p = word; *p; p++) {
+        char cs[2] = {*p, 0};
+        sa_push(&symbols, cs);
+    }
+    sa_push(&symbols, "</w>");
+
+    for (int m = 0; m < tok->n_merges; m++) {
+        const char *ma = tok->merges[m].a;
+        const char *mb = tok->merges[m].b;
+        char new_tok[128];
+        snprintf(new_tok, sizeof(new_tok), "%s%s", ma, mb);
+
+        StrArr merged = {0};
+        int i = 0;
+        int found = 0;
+        while (i < symbols.len) {
+            if (i < symbols.len - 1 &&
+                strcmp(symbols.items[i], ma) == 0 &&
+                strcmp(symbols.items[i+1], mb) == 0) {
+                sa_push(&merged, new_tok);
+                i += 2;
+                found = 1;
+            } else {
+                sa_push(&merged, symbols.items[i]);
+                i++;
+            }
+        }
+        sa_free(&symbols);
+        symbols = merged;
+        if (!found) continue; /* optimization: skip if merge not found */
+    }
+    return symbols;
+}
+
+static int tok_maybe_enable_bpe(EvolvingTokenizer *tok, const char **docs, int n_docs) {
+    if (tok->bpe_enabled) return 0;
+    int total_chars = 0;
+    for (int d = 0; d < n_docs; d++) total_chars += strlen(docs[d]);
+    if (total_chars >= CFG.enable_bpe_after_chars) {
+        tok_train_bpe(tok, docs, n_docs, CFG.bpe_num_merges);
+        tok->bpe_enabled = 1;
+        tok->trained_chars = total_chars;
+        return 1;
+    }
+    return 0;
+}
+
+static int tok_maybe_retrain_bpe(EvolvingTokenizer *tok, const char **docs, int n_docs) {
+    if (!tok->bpe_enabled) return 0;
+    int total_chars = 0;
+    for (int d = 0; d < n_docs; d++) total_chars += strlen(docs[d]);
+    if (total_chars - tok->trained_chars >= CFG.bpe_retrain_every_chars) {
+        tok_train_bpe(tok, docs, n_docs, CFG.bpe_num_merges);
+        tok->trained_chars = total_chars;
+        return 1;
+    }
+    return 0;
+}
+
 static IntArr tok_encode(EvolvingTokenizer *tok, const char *s) {
     IntArr ids = {0};
     /* Skip leading/trailing whitespace */
@@ -1146,11 +1336,47 @@ static IntArr tok_encode(EvolvingTokenizer *tok, const char *s) {
 
     ia_push(&ids, tok->bos_id);
 
-    /* Char-level encoding (BPE TODO for C version) */
-    for (int i = 0; i < slen; i++) {
-        char cs[2] = {s[i], 0};
-        int id = stoi_get(tok->stoi, cs);
-        if (id >= 0) ia_push(&ids, id);
+    if (!tok->bpe_enabled) {
+        /* Char-level encoding */
+        for (int i = 0; i < slen; i++) {
+            char cs[2] = {s[i], 0};
+            int id = stoi_get(tok->stoi, cs);
+            if (id >= 0) ia_push(&ids, id);
+        }
+    } else {
+        /* BPE encoding: split into words, apply merges per word */
+        const char *p = s;
+        const char *end = s + slen;
+        int first_word = 1;
+        while (p < end) {
+            /* Skip spaces */
+            while (p < end && *p == ' ') p++;
+            if (p >= end) break;
+
+            /* Insert space token between words */
+            if (!first_word) {
+                int sp_id = stoi_get(tok->stoi, " ");
+                if (sp_id >= 0) ia_push(&ids, sp_id);
+            }
+            first_word = 0;
+
+            /* Extract word */
+            const char *ws = p;
+            while (p < end && *p != ' ') p++;
+            int wlen = (int)(p - ws);
+            char *word = malloc(wlen + 1);
+            memcpy(word, ws, wlen); word[wlen] = 0;
+
+            /* Apply BPE */
+            StrArr syms = tok_apply_bpe_to_word(tok, word);
+            for (int i = 0; i < syms.len; i++) {
+                if (strcmp(syms.items[i], "</w>") == 0) continue;
+                int id = stoi_get(tok->stoi, syms.items[i]);
+                if (id >= 0) ia_push(&ids, id);
+            }
+            sa_free(&syms);
+            free(word);
+        }
     }
 
     ia_push(&ids, tok->eos_id);
@@ -1412,6 +1638,23 @@ static GPT *gpt_new(EvolvingTokenizer *tok) {
     }
 
     return g;
+}
+
+/* Expand model vocab when tokenizer grows */
+static void gpt_maybe_expand_vocab(GPT *g) {
+    int new_v = g->tok->vocab_size;
+    MatrixParam *wte = gpt_base(g, "wte");
+    if (!wte || new_v <= wte->nout) return;
+    mat_grow_rows(wte, new_v, 0.08);
+    if (!CFG.tie_embeddings) {
+        MatrixParam *lm = gpt_base(g, "lm_head");
+        if (lm && lm != wte) mat_grow_rows(lm, new_v, 0.08);
+    }
+    /* Grow delta lm_head adapters */
+    for (int d = 0; d < g->n_deltas; d++) {
+        DeltaAdapter *da = dmod_get(g->deltas[d], "lm_head");
+        if (da) mat_grow_rows(da->A, new_v, 0.02);
+    }
 }
 
 /* Apply base weight + delta adapters */
@@ -1903,10 +2146,11 @@ static void immune_snap_free(ImmuneSnapshot *snap) {
     free(snap->modules);
 }
 
-/* Contrastive projection: mean direction of embedding drift, normalized */
-static double *gpt_contrastive_projection(GPT *g, int *out_dim) {
+/* Contrastive projection: mean direction of embedding drift, normalized.
+ * Returns magnitude via out_mag. */
+static double *gpt_contrastive_projection(GPT *g, int *out_dim, double *out_mag) {
     MatrixParam *wte = gpt_base(g, "wte");
-    if (!wte || !g->init_embed_snapshot) { *out_dim = 0; return NULL; }
+    if (!wte || !g->init_embed_snapshot) { *out_dim = 0; *out_mag = 0.0; return NULL; }
     int n = wte->nout < g->init_embed_rows ? wte->nout : g->init_embed_rows;
     int dim = wte->nin;
     *out_dim = dim;
@@ -1917,14 +2161,18 @@ static double *gpt_contrastive_projection(GPT *g, int *out_dim) {
     double mag = 0;
     for (int j = 0; j < dim; j++) mag += dir[j] * dir[j];
     mag = sqrt(mag);
+    *out_mag = mag;
     if (mag > 1e-12)
         for (int j = 0; j < dim; j++) dir[j] /= mag;
     return dir;
 }
 
-/* Cosine similarity between pre/post contrastive projection. Negative = noise. */
-static double gpt_drift_check(double *pre, double *post, int dim) {
+/* Cosine similarity between pre/post contrastive projection. Negative = noise.
+ * Skips check when gamma magnitude is too small (early training). */
+static double gpt_drift_check(double *pre, double pre_mag, double *post, double post_mag, int dim) {
     if (!pre || !post) return 1.0;
+    /* Skip immune check when gamma is near-zero (early training, numerically unstable) */
+    if (pre_mag < CFG.gamma_min_magnitude || post_mag < CFG.gamma_min_magnitude) return 1.0;
     double dot = 0;
     for (int i = 0; i < dim; i++) dot += pre[i] * post[i];
     return dot;
@@ -2154,9 +2402,9 @@ static void train_steps(GPT *g, EvolvingTokenizer *tok, StrArr *docs, int steps,
     for (int step = 0; step < steps; step++) {
         arena_reset(&G_arena);
 
-        /* Sample batch of 4 */
+        /* Sample batch */
         Node *total_loss = node_new(1);
-        int batch = 4;
+        int batch = CFG.batch_size;
         for (int b = 0; b < batch; b++) {
             const char *doc = docs->items[rand_int(docs->len)];
             IntArr ids = tok_encode(tok, doc);
@@ -2301,6 +2549,19 @@ static void *background_trainer(void *arg) {
         update_reservoir_corpus(ctx->db, CFG.corpus_path, CFG.max_corpus_lines);
         StrArr docs = load_corpus(CFG.corpus_path);
 
+        /* Tokenizer evolution (char -> BPE enablement) + safe vocab expansion */
+        if (docs.len > 0) {
+            const char **doc_ptrs = (const char **)docs.items;
+            int bpe_changed = tok_maybe_enable_bpe(ctx->tok, doc_ptrs, docs.len);
+            bpe_changed |= tok_maybe_retrain_bpe(ctx->tok, doc_ptrs, docs.len);
+            if (bpe_changed) {
+                pthread_mutex_lock(&ctx->model->mu);
+                gpt_maybe_expand_vocab(ctx->model);
+                save_checkpoint(ctx->model, ctx->tok, NULL);
+                pthread_mutex_unlock(&ctx->model->mu);
+            }
+        }
+
         if (!*ctx->warmed_up && docs.len > 0) {
             printf("[trainer] warmup training... (and so it begins)\n");
             train_steps(ctx->model, ctx->tok, &docs, CFG.warmup_steps, 1, 1);
@@ -2317,17 +2578,17 @@ static void *background_trainer(void *arg) {
                    snap_bytes, snap_novelty);
 
             /* IMMUNE SYSTEM: snapshot before burst */
-            int pre_dim;
-            double *pre_direction = gpt_contrastive_projection(ctx->model, &pre_dim);
+            int pre_dim; double pre_mag;
+            double *pre_direction = gpt_contrastive_projection(ctx->model, &pre_dim, &pre_mag);
             ImmuneSnapshot delta_snap = gpt_snapshot_deltas(ctx->model);
 
             int train_base = !CFG.freeze_base_after_warmup;
             train_steps(ctx->model, ctx->tok, &docs, CFG.micro_steps, train_base, 1);
 
             /* IMMUNE SYSTEM: check drift after burst */
-            int post_dim;
-            double *post_direction = gpt_contrastive_projection(ctx->model, &post_dim);
-            double drift_cos = gpt_drift_check(pre_direction, post_direction, pre_dim);
+            int post_dim; double post_mag;
+            double *post_direction = gpt_contrastive_projection(ctx->model, &post_dim, &post_mag);
+            double drift_cos = gpt_drift_check(pre_direction, pre_mag, post_direction, post_mag, pre_dim);
             if (drift_cos < CFG.noise_drift_threshold) {
                 printf("[immune] NOISE DETECTED (drift cosine=%.3f). Rolling back deltas.\n", drift_cos);
                 gpt_restore_deltas(ctx->model, &delta_snap);
