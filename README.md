@@ -9,7 +9,7 @@
 
 # molecule | by Arianna Method
 
-> *A single-file, async, continually-learning GPT organism with hybrid attention and native personality.*
+> *A GPT organism reproduced in Python, Go, and C. Async, continually-learning, with hybrid attention and native personality.*
 >
 ---
 
