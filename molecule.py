@@ -25,6 +25,7 @@ import json
 import random
 import asyncio
 import sqlite3
+import threading
 from dataclasses import dataclass
 from collections import Counter, defaultdict
 import numpy as np
@@ -64,6 +65,7 @@ class Config:
     eps_adam: float = 1e-8
     grad_clip: float = 1.0    # And lo, the gradients shall not explode into the sun.
     freeze_base_after_warmup: bool = True
+    batch_size: int = 4
 
     # deltas (LoRA-ish)
     delta_rank: int = 8
@@ -97,6 +99,7 @@ class Config:
 
     # noise immune system
     noise_drift_threshold: float = -0.1   # cosine < this = noise, rollback
+    gamma_min_magnitude: float = 1e-6     # skip immune check when gamma direction is near-zero
 
     # entropy-adaptive temperature
     entropy_low: float = 0.5
@@ -389,7 +392,7 @@ def generate_resonant(model, tok, field, prompt_text, use_model=True, model_alph
     if not use_model:
         return corpus_generate(tok, field, prompt_text)
 
-    with no_grad():
+    with model.lock, no_grad():
         return _generate_resonant_impl(model, tok, field, prompt_text, model_alpha)
 
 def _generate_resonant_impl(model, tok, field, prompt_text, model_alpha):
@@ -1140,6 +1143,7 @@ class GPT:
         self.n_head = CFG.n_head
         self.head_dim = CFG.n_embd // CFG.n_head
         self.block_size = CFG.block_size
+        self.lock = threading.Lock()
 
         # Base weights
         V = tok.vocab_size
@@ -1265,19 +1269,20 @@ class GPT:
 
     # And lo, the direction of all change shall be averaged into one arrow, pointing toward who we became.
     def gamma_contrastive_projection(self):
-        """Direction of mean embedding drift — personality vector."""
+        """Direction of mean embedding drift — personality vector.
+        Returns (unit_vector, magnitude) or (None, 0.0) if too early."""
         current = self.base["wte"].rows
         init = self._init_embed_snapshot
         n = min(len(current), len(init))
         if n == 0:
-            return None
+            return None, 0.0
         C = np.vstack([current[i].data for i in range(n)])
         I = np.vstack([np.array(init[i]) for i in range(n)])
         direction = C.mean(axis=0) - I.mean(axis=0)
         mag = float(np.linalg.norm(direction))
         if mag > 1e-10:
             direction = direction / mag
-        return direction.tolist()
+        return direction.tolist(), mag
 
     # ---- Noise Immune System ----
     # And lo, the organism shall know poison from food, and reject what unmakes it.
@@ -1306,12 +1311,16 @@ class GPT:
                     for i, rd in enumerate(b_data):
                         da.B.rows[i].data[:] = rd
 
-    def gamma_drift_check(self, pre_direction):
+    def gamma_drift_check(self, pre_direction, pre_magnitude=0.0):
         """Cosine similarity between pre-burst and post-burst contrastive projection.
-        Negative = drifted opposite to identity trend = likely noise."""
-        post_direction = self.gamma_contrastive_projection()
+        Negative = drifted opposite to identity trend = likely noise.
+        Skips check when gamma magnitude is too small (early training)."""
+        post_direction, post_mag = self.gamma_contrastive_projection()
         if pre_direction is None or post_direction is None:
             return 1.0  # can't check, assume OK
+        # Skip immune check when gamma is near-zero (early training, numerically unstable)
+        if pre_magnitude < CFG.gamma_min_magnitude or post_mag < CFG.gamma_min_magnitude:
+            return 1.0
         # Both are unit vectors, dot product = cosine similarity
         return float(np.dot(pre_direction, post_direction))
 
@@ -1459,7 +1468,7 @@ class GPT:
     def generate_sentence(self, prompt_text=""):
         # And lo, generation shall aim for a sentence, not a random cough.
         # no_grad: inference needs no backward graph — pure mercy for speed.
-        with no_grad():
+        with self.lock, no_grad():
             return self._generate_sentence_impl(prompt_text)
 
     def _generate_sentence_impl(self, prompt_text=""):
@@ -1645,12 +1654,16 @@ def train_steps(model: GPT, tok: EvolvingTokenizer, docs, steps, train_base=True
     if not docs:
         return
 
+    with model.lock:
+        _train_steps_locked(model, tok, docs, steps, train_base, train_deltas)
+
+def _train_steps_locked(model, tok, docs, steps, train_base, train_deltas):
     base_params = model.all_base_params() if train_base else []
     delta_params = model.all_delta_params() if train_deltas else []
 
     for step in range(steps):
         # And lo, the training batch shall be sampled from the cursed book of names.
-        batch = random.choices(docs, k=4)
+        batch = random.choices(docs, k=CFG.batch_size)
         batch_ids = [tok.encode(doc) for doc in batch if doc]
 
         loss = model.loss_on_batch(batch_ids)
@@ -1716,15 +1729,16 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer):
         bpe_just_enabled = tok.maybe_enable_bpe(docs)
         bpe_retrained = tok.maybe_retrain_bpe(docs)
         if bpe_just_enabled or bpe_retrained:
-            # Ensure model can handle new vocab size
-            model.maybe_expand_vocab(tok.vocab_size)
-            save_checkpoint(model, tok)
+            with model.lock:
+                model.maybe_expand_vocab(tok.vocab_size)
+                save_checkpoint(model, tok)
 
         if (not warmed_up) and docs:
             print("[trainer] warmup training... (and so it begins)")
             train_steps(model, tok, docs, CFG.warmup_steps,
                         train_base=True, train_deltas=True)
-            save_checkpoint(model, tok)
+            with model.lock:
+                save_checkpoint(model, tok)
             db_log_growth(con, model, tok, docs, note="warmup_complete")
             warmed_up = True
             print("[trainer] warmup complete. base may freeze now, like a proud fossil.")
@@ -1735,30 +1749,33 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer):
                 nov = qbuf.novelty_score()
                 print(f"[trainer] quantum burst (bytes={qbuf.accumulated_bytes}, novelty={nov:.3f})")
 
-                # IMMUNE SYSTEM: snapshot before burst
-                pre_direction = model.gamma_contrastive_projection()
-                delta_snap = model.snapshot_deltas()
+                with model.lock:
+                    # IMMUNE SYSTEM: snapshot before burst
+                    pre_direction, pre_mag = model.gamma_contrastive_projection()
+                    delta_snap = model.snapshot_deltas()
 
                 train_base = not CFG.freeze_base_after_warmup
                 train_steps(model, tok, docs, CFG.micro_steps,
                             train_base=train_base, train_deltas=True)
 
-                # IMMUNE SYSTEM: check drift after burst
-                drift_cos = model.gamma_drift_check(pre_direction)
-                if drift_cos < CFG.noise_drift_threshold:
-                    print(f"[immune] NOISE DETECTED (drift cosine={drift_cos:.3f}). Rolling back deltas.")
-                    model.restore_deltas(delta_snap)
-                    db_log_growth(con, model, tok, docs, note="noise_rejected")
-                else:
-                    save_checkpoint(model, tok)
-                    db_log_growth(con, model, tok, docs, note="quantum_burst")
+                with model.lock:
+                    # IMMUNE SYSTEM: check drift after burst
+                    drift_cos = model.gamma_drift_check(pre_direction, pre_mag)
+                    if drift_cos < CFG.noise_drift_threshold:
+                        print(f"[immune] NOISE DETECTED (drift cosine={drift_cos:.3f}). Rolling back deltas.")
+                        model.restore_deltas(delta_snap)
+                        db_log_growth(con, model, tok, docs, note="noise_rejected")
+                    else:
+                        save_checkpoint(model, tok)
+                        db_log_growth(con, model, tok, docs, note="quantum_burst")
                 qbuf.reset()
 
                 # occasionally grow a new delta module
                 if len(model.deltas) < CFG.max_delta_modules and random.random() < CFG.delta_grow_prob:
                     print(f"[trainer] growing new delta module (total: {len(model.deltas)+1})")
-                    model.add_delta_module(alpha=1.0)
-                    save_checkpoint(model, tok)
+                    with model.lock:
+                        model.add_delta_module(alpha=1.0)
+                        save_checkpoint(model, tok)
 
         await asyncio.sleep(CFG.train_tick_seconds)
 

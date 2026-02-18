@@ -58,6 +58,7 @@ type Config struct {
 	EpsAdam             float64 `json:"eps_adam"`
 	GradClip            float64 `json:"grad_clip"`
 	FreezeBaseAfterWarm bool    `json:"freeze_base_after_warmup"`
+	BatchSize           int     `json:"batch_size"`
 
 	// deltas
 	DeltaRank      int     `json:"delta_rank"`
@@ -91,6 +92,7 @@ type Config struct {
 
 	// noise immune system
 	NoiseDriftThreshold float64 `json:"noise_drift_threshold"`
+	GammaMinMagnitude   float64 `json:"gamma_min_magnitude"` // skip immune check when gamma direction is near-zero
 
 	// entropy-adaptive temperature
 	EntropyLow       float64 `json:"entropy_low"`
@@ -127,6 +129,7 @@ var CFG = Config{
 	EpsAdam:              1e-8,
 	GradClip:             1.0,
 	FreezeBaseAfterWarm:  true,
+	BatchSize:            4,
 	DeltaRank:            8,
 	MaxDeltaModules:      12,
 	DeltaGrowProb:        0.08,
@@ -147,6 +150,7 @@ var CFG = Config{
 	HybridAlphaInit:        0.5,
 	GammaSparsityThreshold: 0.01,
 	NoiseDriftThreshold:    -0.1,
+	GammaMinMagnitude:      1e-6,
 	EntropyLow:             0.5,
 	EntropyHigh:            1.5,
 	EntropyTempBoost:       1.2,
@@ -1516,7 +1520,7 @@ func (gpt *GPT) GammaStats() GammaStatsResult {
 }
 
 // And lo, the direction of all change shall be averaged into one arrow, pointing toward who we became.
-func (gpt *GPT) GammaContrastiveProjection() []float64 {
+func (gpt *GPT) GammaContrastiveProjection() ([]float64, float64) {
 	current := gpt.Base["wte"].Rows
 	init := gpt.InitEmbedSnapshot
 	n := len(current)
@@ -1524,7 +1528,7 @@ func (gpt *GPT) GammaContrastiveProjection() []float64 {
 		n = len(init)
 	}
 	if n == 0 || len(init[0]) == 0 {
-		return nil
+		return nil, 0.0
 	}
 	dim := len(init[0])
 	direction := make([]float64, dim)
@@ -1544,7 +1548,7 @@ func (gpt *GPT) GammaContrastiveProjection() []float64 {
 			direction[i] /= mag
 		}
 	}
-	return direction
+	return direction, mag
 }
 
 // ---- Noise Immune System ----
@@ -1603,10 +1607,15 @@ func (gpt *GPT) RestoreDeltas(snap [][][2][][]float64) {
 
 // GammaDriftCheck returns cosine similarity between pre-burst and current contrastive projection.
 // Negative = drifted opposite to identity trend = likely noise.
-func (gpt *GPT) GammaDriftCheck(preDirection []float64) float64 {
-	postDirection := gpt.GammaContrastiveProjection()
+// Skips check when gamma magnitude is too small (early training, numerically unstable).
+func (gpt *GPT) GammaDriftCheck(preDirection []float64, preMagnitude float64) float64 {
+	postDirection, postMag := gpt.GammaContrastiveProjection()
 	if preDirection == nil || postDirection == nil {
 		return 1.0 // can't check, assume OK
+	}
+	// Skip immune check when gamma is near-zero (early training)
+	if preMagnitude < CFG.GammaMinMagnitude || postMag < CFG.GammaMinMagnitude {
+		return 1.0
 	}
 	dot := 0.0
 	for i := 0; i < len(preDirection) && i < len(postDirection); i++ {
@@ -2800,7 +2809,7 @@ func trainSteps(model *GPT, tok *EvolvingTokenizer, docs []string, steps int, tr
 
 	for step := 0; step < steps; step++ {
 		// Sample batch
-		batch := make([]string, 4)
+		batch := make([]string, CFG.BatchSize)
 		for i := range batch {
 			batch[i] = docs[rand.Intn(len(docs))]
 		}
@@ -2867,14 +2876,14 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 				snapBytes, snapNovelty)
 
 			// IMMUNE SYSTEM: snapshot before burst
-			preDirection := model.GammaContrastiveProjection()
+			preDirection, preMag := model.GammaContrastiveProjection()
 			deltaSnap := model.SnapshotDeltas()
 
 			trainBase := !CFG.FreezeBaseAfterWarm
 			trainSteps(model, tok, docs, CFG.MicroSteps, trainBase, true)
 
 			// IMMUNE SYSTEM: check drift after burst
-			driftCos := model.GammaDriftCheck(preDirection)
+			driftCos := model.GammaDriftCheck(preDirection, preMag)
 			if driftCos < CFG.NoiseDriftThreshold {
 				fmt.Printf("[immune] NOISE DETECTED (drift cosine=%.3f). Rolling back deltas.\n", driftCos)
 				model.RestoreDeltas(deltaSnap)
