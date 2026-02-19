@@ -17,10 +17,14 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	_ "modernc.org/sqlite"
 )
@@ -49,6 +53,10 @@ type Config struct {
 	NHead         int  `json:"n_head"`
 	BlockSize     int  `json:"block_size"`
 
+	// ontogenesis — growth stages (corpus_chars, n_embd, n_layer, n_head)
+	GrowthStages          [][4]int `json:"growth_stages"`
+	FreezeAfterGrowthSteps int     `json:"freeze_after_growth_steps"`
+
 	// training
 	WarmupSteps         int     `json:"warmup_steps"`
 	MicroSteps          int     `json:"micro_steps"`
@@ -59,6 +67,14 @@ type Config struct {
 	GradClip            float64 `json:"grad_clip"`
 	FreezeBaseAfterWarm bool    `json:"freeze_base_after_warmup"`
 	BatchSize           int     `json:"batch_size"`
+
+	// cosine LR schedule
+	LRMin              float64 `json:"lr_min"`
+	MaxTotalSteps      int     `json:"max_total_steps"`
+	CosineWarmupSteps  int     `json:"cosine_warmup_steps"`
+
+	// gradient accumulation
+	AccumSteps int `json:"accum_steps"`
 
 	// deltas
 	DeltaRank      int     `json:"delta_rank"`
@@ -101,7 +117,9 @@ type Config struct {
 	EntropyTempFocus float64 `json:"entropy_temp_focus"`
 
 	// corpus field
-	CorpusGenMaxTokens int `json:"corpus_gen_max_tokens"`
+	CorpusGenMaxTokens   int     `json:"corpus_gen_max_tokens"`
+	CorpusFadeK          float64 `json:"corpus_fade_k"`          // sigmoid steepness for corpus→model transition
+	CorpusFadeThreshold  float64 `json:"corpus_fade_threshold"`  // entropy at which blend is 50/50
 
 	// quantum buffer
 	QBMinBytes        int     `json:"qb_min_bytes"`
@@ -125,10 +143,19 @@ var CFG = Config{
 	MaxLineChars:         240,
 	MinNewChars:          480,
 	TieEmbeddings:        true,
-	NLayer:               2,
-	NEmbd:                72,
-	NHead:                4,
+	NLayer:               1,
+	NEmbd:                16,
+	NHead:                1,
 	BlockSize:            96,
+
+	GrowthStages: [][4]int{
+		{0, 16, 1, 1},       // embryo: ~25K params
+		{20000, 32, 1, 2},   // infant: ~100K params
+		{50000, 64, 2, 4},   // child: ~500K params
+		{200000, 128, 4, 4}, // adolescent: ~2M params
+		{500000, 256, 6, 8}, // adult: ~10M params
+	},
+	FreezeAfterGrowthSteps: 200,
 	WarmupSteps:          1200,
 	MicroSteps:           32,
 	LearningRate:         0.01,
@@ -138,6 +165,10 @@ var CFG = Config{
 	GradClip:             1.0,
 	FreezeBaseAfterWarm:  true,
 	BatchSize:            4,
+	LRMin:                0.001,
+	MaxTotalSteps:        50000,
+	CosineWarmupSteps:    200,
+	AccumSteps:           1,
 	DeltaRank:            8,
 	MaxDeltaModules:      12,
 	DeltaGrowProb:        0.08,
@@ -149,12 +180,12 @@ var CFG = Config{
 	MaxGenTokens:         180,
 	MinGenTokens:         16,
 	RepetitionGuard:      4,
-	EnableBPEAfterChars:  25000,
+	EnableBPEAfterChars:  20000,
 	BPENumMerges:         384,
 	BPERetrainEveryChars: 4000,
 	TrainTickSeconds:     0.25,
 
-	HeadTypes:              []string{"content", "content", "hybrid", "hybrid"},
+	HeadTypes:              []string{"content"},
 	HybridAlphaInit:        0.5,
 	GammaSparsityThreshold: 0.01,
 	NoiseDriftThreshold:    -0.1,
@@ -164,6 +195,8 @@ var CFG = Config{
 	EntropyTempBoost:       1.2,
 	EntropyTempFocus:       0.8,
 	CorpusGenMaxTokens:     120,
+	CorpusFadeK:            3.0,
+	CorpusFadeThreshold:    1.5,
 	QBMinBytes:             1024,
 	QBMinNovelty:           0.15,
 	QBCooldownSeconds:      60.0,
@@ -174,6 +207,26 @@ var CFG = Config{
 	SyntropyLRBoost:        1.3,
 	SyntropyLRDampen:       0.6,
 	SyntropyDeltaGrowBoost: 0.15,
+}
+
+// headTypesForNHead returns the head type list for a given number of heads.
+// Embryo: 1 head = 1 content. Growth adds hybrid heads.
+func headTypesForNHead(n int) []string {
+	if n <= 1 {
+		return []string{"content"}
+	}
+	if n == 2 {
+		return []string{"content", "hybrid"}
+	}
+	half := n / 2
+	types := make([]string, n)
+	for i := 0; i < half; i++ {
+		types[i] = "content"
+	}
+	for i := half; i < n; i++ {
+		types[i] = "hybrid"
+	}
+	return types
 }
 
 // ============================================================
@@ -347,6 +400,29 @@ func (v *Vec) ReLU() *Vec {
 				if vData[i] > 0 {
 					v.Grad[i] += out.Grad[i]
 				}
+			}
+		}
+	}
+	return out
+}
+
+// SiLU applies silu(x) = x * sigmoid(x) element-wise (for real SwiGLU).
+func (v *Vec) SiLU() *Vec {
+	n := len(v.Data)
+	sig := make([]float64, n)
+	d := make([]float64, n)
+	for i := 0; i < n; i++ {
+		sig[i] = 1.0 / (1.0 + math.Exp(-v.Data[i]))
+		d[i] = v.Data[i] * sig[i]
+	}
+	out := NewVec(d)
+	if gradEnabled {
+		out.children = []Node{v}
+		vData := v.Data
+		out.backFn = func() {
+			for i := 0; i < n; i++ {
+				// d/dx[x * sigmoid(x)] = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+				v.Grad[i] += (sig[i] * (1.0 + vData[i]*(1.0-sig[i]))) * out.Grad[i]
 			}
 		}
 	}
@@ -541,11 +617,16 @@ func (s *Scalar) Sigmoid() *Scalar {
 	return out
 }
 
+// backwardVisitedPool reuses visited maps across Backward calls to reduce GC pressure.
+var backwardVisitedPool = sync.Pool{
+	New: func() interface{} { return make(map[Node]bool) },
+}
+
 // Backward performs reverse-mode autodiff from this node.
 // And lo, the graph shall be walked backwards, like a salmon with regrets.
 func Backward(root Node) {
 	topo := make([]Node, 0)
-	visited := make(map[Node]bool)
+	visited := backwardVisitedPool.Get().(map[Node]bool)
 
 	var build func(n Node)
 	build = func(n Node) {
@@ -559,6 +640,12 @@ func Backward(root Node) {
 		topo = append(topo, n)
 	}
 	build(root)
+
+	// Clear and return visited map to pool
+	for k := range visited {
+		delete(visited, k)
+	}
+	backwardVisitedPool.Put(visited)
 
 	// Set root gradient
 	switch r := root.(type) {
@@ -648,6 +735,31 @@ func (m *MatrixParam) GrowRows(newNout int, std float64) {
 		m.Rows = append(m.Rows, NewVec(d))
 	}
 	m.Nout = newNout
+}
+
+// GrowCols extends each row's Data slice with gaussian noise. Update Nin.
+// And lo, the matrix shall widen its reach, each row stretching into new dimensions.
+func (m *MatrixParam) GrowCols(newNin int, std float64) {
+	if newNin <= m.Nin {
+		return
+	}
+	extra := newNin - m.Nin
+	for _, row := range m.Rows {
+		ext := make([]float64, extra)
+		for j := range ext {
+			ext[j] = rand.NormFloat64() * std
+		}
+		row.Data = append(row.Data, ext...)
+		row.Grad = append(row.Grad, make([]float64, extra)...)
+	}
+	m.Nin = newNin
+}
+
+// Grow extends both dimensions. Cols first so new rows get full width.
+// Ontogenesis: the matrix grows into a larger space.
+func (m *MatrixParam) Grow(newNout, newNin int, std float64) {
+	m.GrowCols(newNin, std)
+	m.GrowRows(newNout, std)
 }
 
 // Params returns all row vectors (for optimizer).
@@ -982,6 +1094,13 @@ func (da *DeltaAdapter) MaybeGrowOut(newNout int) {
 	da.A.GrowRows(newNout, 0.02)
 }
 
+// GrowDims grows both outer dimensions of the adapter. Rank stays the same.
+// Ontogenesis: A.GrowRows(newNout), B.GrowCols(newNin).
+func (da *DeltaAdapter) GrowDims(newNout, newNin int) {
+	da.A.GrowRows(newNout, 0.02)
+	da.B.GrowCols(newNin, 0.02)
+}
+
 func (da *DeltaAdapter) Params() []*Vec {
 	out := make([]*Vec, 0, da.A.Nout+da.B.Nout)
 	out = append(out, da.A.Params()...)
@@ -990,7 +1109,7 @@ func (da *DeltaAdapter) Params() []*Vec {
 }
 
 // ============================================================
-// 4) TOKENIZER — char first, then BPE that only EXPANDS vocab
+// 4) TOKENIZER — byte-level BPE (GPT-3/4 style)
 // ============================================================
 
 type MergePair struct {
@@ -1015,17 +1134,11 @@ type EvolvingTokenizer struct {
 }
 
 func NewEvolvingTokenizer(docs []string) *EvolvingTokenizer {
-	baseText := strings.Join(docs, "\n") + "\n"
-
-	charSet := make(map[rune]bool)
-	for _, ch := range baseText {
-		charSet[ch] = true
+	// Count trained chars from docs (byte-level: count bytes, not runes)
+	totalChars := 0
+	for _, d := range docs {
+		totalChars += len(d)
 	}
-	chars := make([]string, 0, len(charSet))
-	for ch := range charSet {
-		chars = append(chars, string(ch))
-	}
-	sort.Strings(chars)
 
 	tok := &EvolvingTokenizer{
 		BOS:          "<BOS>",
@@ -1034,12 +1147,19 @@ func NewEvolvingTokenizer(docs []string) *EvolvingTokenizer {
 		Stoi:         make(map[string]int),
 		Itos:         make(map[int]string),
 		MergeToTok:   make(map[MergePair]string),
-		TrainedChars: len(baseText),
+		TrainedChars: totalChars,
 	}
 
-	tok.Tokens = append(tok.Tokens, chars...)
-	tok.Tokens = append(tok.Tokens, tok.PAD, tok.BOS, tok.EOS)
+	// Fixed 259 tokens: 256 byte tokens + BOS + EOS + PAD
+	tokens := make([]string, 256+3)
+	for i := 0; i < 256; i++ {
+		tokens[i] = fmt.Sprintf("0x%02x", i)
+	}
+	tokens[256] = tok.BOS
+	tokens[257] = tok.EOS
+	tokens[258] = tok.PAD
 
+	tok.Tokens = tokens
 	for i, t := range tok.Tokens {
 		tok.Stoi[t] = i
 		tok.Itos[i] = t
@@ -1048,13 +1168,65 @@ func NewEvolvingTokenizer(docs []string) *EvolvingTokenizer {
 	return tok
 }
 
-func (t *EvolvingTokenizer) wordToSymbols(word string) []string {
-	syms := make([]string, 0, len([]rune(word))+1)
-	for _, ch := range word {
-		syms = append(syms, string(ch))
+// unicodeSegment splits text into segments by Unicode category.
+// Letters+marks → 'L', digits → 'N', whitespace → 'Z', everything else → 'P'.
+// Each segment is returned as its raw UTF-8 bytes.
+func unicodeSegment(text string) [][]byte {
+	if len(text) == 0 {
+		return nil
 	}
-	syms = append(syms, "</w>")
-	return syms
+	runeCategory := func(r rune) byte {
+		if unicode.IsLetter(r) || unicode.IsMark(r) {
+			return 'L'
+		}
+		if unicode.IsDigit(r) {
+			return 'N'
+		}
+		if unicode.IsSpace(r) {
+			return 'Z'
+		}
+		return 'P'
+	}
+	var segments [][]byte
+	var cur []byte
+	var curCat byte
+	for i, r := range text {
+		cat := runeCategory(r)
+		if i == 0 {
+			curCat = cat
+		}
+		if cat != curCat {
+			segments = append(segments, cur)
+			cur = nil
+			curCat = cat
+		}
+		cur = append(cur, []byte(string(r))...)
+	}
+	if len(cur) > 0 {
+		segments = append(segments, cur)
+	}
+	return segments
+}
+
+// tokenToBytes converts a byte-level BPE token name back to raw bytes.
+// "0xNN" → single byte, "0x48+0x65" → two bytes, etc.
+func tokenToBytes(tok string) []byte {
+	if !strings.Contains(tok, "+") && strings.HasPrefix(tok, "0x") && len(tok) == 4 {
+		b, _ := strconv.ParseUint(tok[2:], 16, 8)
+		return []byte{byte(b)}
+	}
+	if strings.Contains(tok, "+") {
+		parts := strings.Split(tok, "+")
+		result := make([]byte, 0, len(parts))
+		for _, p := range parts {
+			if strings.HasPrefix(p, "0x") && len(p) == 4 {
+				b, _ := strconv.ParseUint(p[2:], 16, 8)
+				result = append(result, byte(b))
+			}
+		}
+		return result
+	}
+	return nil
 }
 
 func (t *EvolvingTokenizer) MaybeEnableBPE(docs []string) bool {
@@ -1089,18 +1261,25 @@ func (t *EvolvingTokenizer) MaybeRetrainBPE(docs []string) bool {
 
 func (t *EvolvingTokenizer) TrainBPE(docs []string, numMerges int) {
 	text := strings.Join(docs, " ")
-	words := strings.Fields(text)
-	if len(words) == 0 {
+	if len(text) == 0 {
 		return
 	}
 
-	// Build vocab: tuple of symbols -> frequency
-	type symKey string
-	vocab := make(map[string]int) // key = JSON-serialized symbol sequence
+	// Split text into Unicode segments, convert each to byte-token sequences
+	segments := unicodeSegment(text)
+	if len(segments) == 0 {
+		return
+	}
+
+	// Build vocab: token sequence → frequency
+	vocab := make(map[string]int)    // key = null-separated token names
 	symSeqs := make(map[string][]string)
 
-	for _, w := range words {
-		syms := t.wordToSymbols(w)
+	for _, seg := range segments {
+		syms := make([]string, len(seg))
+		for i, b := range seg {
+			syms[i] = fmt.Sprintf("0x%02x", b)
+		}
 		key := encodeSyms(syms)
 		vocab[key]++
 		symSeqs[key] = syms
@@ -1133,7 +1312,7 @@ func (t *EvolvingTokenizer) TrainBPE(docs []string, numMerges int) {
 			}
 		}
 
-		newTok := best.A + best.B
+		newTok := best.A + "+" + best.B
 		merges = append(merges, best)
 		mergeToTok[best] = newTok
 
@@ -1181,23 +1360,21 @@ func encodeSyms(syms []string) string {
 	return strings.Join(syms, "\x00")
 }
 
-func (t *EvolvingTokenizer) applyBPEToWord(word string) []string {
-	symbols := t.wordToSymbols(word)
-
+func (t *EvolvingTokenizer) applyBPE(tokens []string) []string {
 	rank := make(map[MergePair]int)
 	for i, p := range t.Merges {
 		rank[p] = i
 	}
 
-	for {
-		if len(symbols) < 2 {
-			break
-		}
-		bestRank := int(1e9)
+	symbols := make([]string, len(tokens))
+	copy(symbols, tokens)
+
+	for len(symbols) >= 2 {
+		bestRank := 1 << 30
 		bestIdx := -1
 		for i := 0; i < len(symbols)-1; i++ {
-			p := MergePair{symbols[i], symbols[i+1]}
-			if r, ok := rank[p]; ok && r < bestRank {
+			key := MergePair{symbols[i], symbols[i+1]}
+			if r, ok := rank[key]; ok && r < bestRank {
 				bestRank = r
 				bestIdx = i
 			}
@@ -1205,11 +1382,11 @@ func (t *EvolvingTokenizer) applyBPEToWord(word string) []string {
 		if bestIdx == -1 {
 			break
 		}
-		p := MergePair{symbols[bestIdx], symbols[bestIdx+1]}
-		newTok := t.MergeToTok[p]
+		pair := MergePair{symbols[bestIdx], symbols[bestIdx+1]}
+		merged := t.MergeToTok[pair]
 		newSymbols := make([]string, 0, len(symbols)-1)
 		newSymbols = append(newSymbols, symbols[:bestIdx]...)
-		newSymbols = append(newSymbols, newTok)
+		newSymbols = append(newSymbols, merged)
 		newSymbols = append(newSymbols, symbols[bestIdx+2:]...)
 		symbols = newSymbols
 	}
@@ -1220,31 +1397,20 @@ func (t *EvolvingTokenizer) Encode(s string) []int {
 	s = strings.TrimSpace(s)
 	ids := []int{t.Stoi[t.BOS]}
 
-	if !t.BPEEnabled {
-		for _, ch := range s {
-			cs := string(ch)
-			if id, ok := t.Stoi[cs]; ok {
-				ids = append(ids, id)
-			}
+	segments := unicodeSegment(s)
+	for _, seg := range segments {
+		// Convert bytes to base token names
+		baseTokens := make([]string, len(seg))
+		for i, b := range seg {
+			baseTokens[i] = fmt.Sprintf("0x%02x", b)
 		}
-		ids = append(ids, t.Stoi[t.EOS])
-		return ids
-	}
-
-	// BPE mode
-	words := strings.Fields(s)
-	for wi, w := range words {
-		syms := t.applyBPEToWord(w)
-		for _, tok := range syms {
-			if tok == "</w>" {
-				continue
-			}
+		// Apply BPE merges if enabled
+		if t.BPEEnabled {
+			baseTokens = t.applyBPE(baseTokens)
+		}
+		// Look up each token in stoi
+		for _, tok := range baseTokens {
 			if id, ok := t.Stoi[tok]; ok {
-				ids = append(ids, id)
-			}
-		}
-		if wi != len(words)-1 {
-			if id, ok := t.Stoi[" "]; ok {
 				ids = append(ids, id)
 			}
 		}
@@ -1254,7 +1420,7 @@ func (t *EvolvingTokenizer) Encode(s string) []int {
 }
 
 func (t *EvolvingTokenizer) Decode(ids []int) string {
-	var out strings.Builder
+	var rawBytes []byte
 	for _, id := range ids {
 		tok := t.Itos[id]
 		if tok == t.BOS || tok == t.PAD {
@@ -1263,16 +1429,45 @@ func (t *EvolvingTokenizer) Decode(ids []int) string {
 		if tok == t.EOS {
 			break
 		}
-		out.WriteString(tok)
+		b := tokenToBytes(tok)
+		if b != nil {
+			rawBytes = append(rawBytes, b...)
+		}
 	}
-	s := out.String()
-	s = strings.ReplaceAll(s, "</w>", "")
-	return strings.TrimSpace(strings.Join(strings.Fields(s), " "))
+	return strings.TrimSpace(string(rawBytes))
 }
 
 // ============================================================
 // 5) GPT MODEL — a small beast with RoPE
 // ============================================================
+
+// ropeCache stores pre-computed cos/sin pairs for RoPE.
+// Key: [2]int{pos, headDim}, Value: *[2][]float64{cosines, sines}
+var ropeCache sync.Map
+
+type ropePair struct {
+	cos []float64
+	sin []float64
+}
+
+func getRoPECosSin(pos, headDim int) *ropePair {
+	key := [2]int{pos, headDim}
+	if cached, ok := ropeCache.Load(key); ok {
+		return cached.(*ropePair)
+	}
+	n := headDim / 2
+	pair := &ropePair{
+		cos: make([]float64, n),
+		sin: make([]float64, n),
+	}
+	for j := 0; j < n; j++ {
+		theta := float64(pos) / math.Pow(10000.0, float64(2*j)/float64(headDim))
+		pair.cos[j] = math.Cos(theta)
+		pair.sin[j] = math.Sin(theta)
+	}
+	ropeCache.Store(key, pair)
+	return pair
+}
 
 // RoPERotate applies rotary position encoding to a head vector.
 // And lo, positions shall become angles, and angles shall become meaning.
@@ -1282,10 +1477,11 @@ func RoPERotate(vec *Vec, pos int, headDim int) *Vec {
 	outData := make([]float64, len(x))
 	copy(outData, x)
 
-	for i := 0; i < headDim-1; i += 2 {
-		theta := float64(pos) / math.Pow(10000.0, float64(i)/float64(headDim))
-		c := math.Cos(theta)
-		s := math.Sin(theta)
+	rp := getRoPECosSin(pos, headDim)
+	for j := 0; j < headDim/2; j++ {
+		i := j * 2
+		c := rp.cos[j]
+		s := rp.sin[j]
 		a := x[i]
 		b := x[i+1]
 		outData[i] = a*c - b*s
@@ -1296,10 +1492,11 @@ func RoPERotate(vec *Vec, pos int, headDim int) *Vec {
 	if gradEnabled {
 		out.children = []Node{vec}
 		out.backFn = func() {
-			for i := 0; i < headDim-1; i += 2 {
-				theta := float64(pos) / math.Pow(10000.0, float64(i)/float64(headDim))
-				c := math.Cos(theta)
-				s := math.Sin(theta)
+			rpBack := getRoPECosSin(pos, headDim)
+			for j := 0; j < headDim/2; j++ {
+				i := j * 2
+				c := rpBack.cos[j]
+				s := rpBack.sin[j]
 				ga := out.Grad[i]
 				gb := out.Grad[i+1]
 				vec.Grad[i] += ga*c + gb*s
@@ -1321,6 +1518,13 @@ type GammaStatsResult struct {
 	NRows     int
 }
 
+// layerKeySet holds pre-computed string keys for a single layer, avoiding fmt.Sprintf per call.
+type layerKeySet struct {
+	wq, wk, wv, wo, fcG, fcV, fc2 string
+	headPattern []string // per head
+	headAlpha   []string // per head
+}
+
 // GPT is the full model.
 type GPT struct {
 	Tok       *EvolvingTokenizer
@@ -1336,6 +1540,19 @@ type GPT struct {
 	Adam        map[string]*AdamState
 
 	InitEmbedSnapshot [][]float64 // snapshot of initial embeddings for gamma
+
+	residualAlpha    float64 // 1/sqrt(nLayer) scaling for residual connections
+	globalStep       int     // global training step counter (for cosine LR + checkpoint)
+	syntropyTempOff  float64 // temperature offset from syntropy state (-0.05 to +0.05)
+
+	growthFreezeRemaining int // ontogenesis: freeze base after growth, train only deltas
+
+	corpusField *CooccurField // set by backgroundTrainer for adaptive blend
+
+	layerKeys []layerKeySet // pre-computed string keys per layer
+
+	// inherited burst history from parent (mitosis lineage)
+	inheritedBurstHistory []BurstRecord
 
 	mu sync.Mutex // protects model during concurrent access
 }
@@ -1357,6 +1574,8 @@ func NewGPT(tok *EvolvingTokenizer) *GPT {
 		Base:      make(map[string]*MatrixParam),
 		Adam:      make(map[string]*AdamState),
 	}
+
+	gpt.residualAlpha = 1.0 / math.Sqrt(math.Max(1, float64(CFG.NLayer)))
 
 	V := tok.VocabSize
 	gpt.Base["wte"] = NewMatrixParam(V, CFG.NEmbd, 0.08)
@@ -1387,6 +1606,31 @@ func NewGPT(tok *EvolvingTokenizer) *GPT {
 			gpt.Base[alphaKey] = NewMatrixParam(1, 1, 0.0)
 			gpt.Base[alphaKey].Rows[0].Data[0] = CFG.HybridAlphaInit
 		}
+	}
+
+	// Pre-compute layer key strings to avoid fmt.Sprintf per ForwardStep call
+	gpt.layerKeys = make([]layerKeySet, CFG.NLayer)
+	for li := 0; li < CFG.NLayer; li++ {
+		pfx := fmt.Sprintf("l%d.", li)
+		lk := layerKeySet{
+			wq:  pfx + "wq",
+			wk:  pfx + "wk",
+			wv:  pfx + "wv",
+			wo:  pfx + "wo",
+			fcG: pfx + "fc_g",
+			fcV: pfx + "fc_v",
+			fc2: pfx + "fc2",
+		}
+		nHeads := len(CFG.HeadTypes)
+		if nHeads > 0 {
+			lk.headPattern = make([]string, nHeads)
+			lk.headAlpha = make([]string, nHeads)
+			for h := 0; h < nHeads; h++ {
+				lk.headPattern[h] = fmt.Sprintf("l%d.h%d.w_pattern", li, h)
+				lk.headAlpha[h] = fmt.Sprintf("l%d.h%d.alpha", li, h)
+			}
+		}
+		gpt.layerKeys[li] = lk
 	}
 
 	gpt.AddDeltaModule(1.0)
@@ -1639,6 +1883,244 @@ func (gpt *GPT) GammaDriftCheck(preDirection []float64, preMagnitude float64) fl
 	return dot // both unit vectors, dot = cosine
 }
 
+// ---- Ontogenesis (architecture growth) ----
+// And lo, the organism shall not be born adult but shall grow, stage by stage,
+// from embryo to child to adolescent, each growth a small death and rebirth.
+
+// CurrentGrowthStage returns index of current stage based on model dimensions.
+// Returns -1 for legacy checkpoints where dimensions don't match any stage.
+func (gpt *GPT) CurrentGrowthStage() int {
+	for i, stage := range CFG.GrowthStages {
+		if gpt.NEmbd == stage[1] && gpt.NLayer == stage[2] && gpt.NHead == stage[3] {
+			return i
+		}
+	}
+	return -1 // dimensions don't match any stage (legacy checkpoint)
+}
+
+// TargetGrowthStage returns the target stage index based on corpus size.
+func (gpt *GPT) TargetGrowthStage(corpusChars int) int {
+	target := 0
+	for i, stage := range CFG.GrowthStages {
+		if corpusChars >= stage[0] {
+			target = i
+		}
+	}
+	return target
+}
+
+// MaybeGrowArchitecture checks if growth is needed and executes it. Returns true if grew.
+func (gpt *GPT) MaybeGrowArchitecture(corpusChars int) bool {
+	current := gpt.CurrentGrowthStage()
+	if current < 0 {
+		return false // legacy checkpoint, skip growth
+	}
+	target := gpt.TargetGrowthStage(corpusChars)
+	if target <= current {
+		return false
+	}
+
+	newEmbd := CFG.GrowthStages[target][1]
+	newLayer := CFG.GrowthStages[target][2]
+	newHead := CFG.GrowthStages[target][3]
+	oldEmbd := gpt.NEmbd
+	oldLayer := gpt.NLayer
+	oldHead := gpt.NHead
+	newHeadDim := newEmbd / newHead
+
+	fmt.Printf("[growth] ONTOGENESIS: stage %d -> %d\n", current, target)
+	fmt.Printf("  embd: %d -> %d, layer: %d -> %d, head: %d -> %d\n",
+		oldEmbd, newEmbd, oldLayer, newLayer, oldHead, newHead)
+
+	// 1. Grow embedding matrices (columns only — vocab rows stay)
+	gpt.Base["wte"].GrowCols(newEmbd, 0.02)
+	gpt.Base["wpe"].GrowCols(newEmbd, 0.02)
+	if !CFG.TieEmbeddings {
+		gpt.Base["lm_head"].GrowCols(newEmbd, 0.02)
+	}
+
+	// 2. Grow existing layer matrices
+	newHtypes := headTypesForNHead(newHead)
+	for li := 0; li < oldLayer; li++ {
+		pfx := fmt.Sprintf("l%d.", li)
+		for _, name := range []string{"wq", "wk", "wv", "wo"} {
+			gpt.Base[pfx+name].Grow(newEmbd, newEmbd, 0.08)
+		}
+		gpt.Base[pfx+"fc_g"].Grow(4*newEmbd, newEmbd, 0.08)
+		gpt.Base[pfx+"fc_v"].Grow(4*newEmbd, newEmbd, 0.08)
+		gpt.Base[pfx+"fc2"].Grow(newEmbd, 4*newEmbd, 0.08)
+		// Grow existing head pattern matrices
+		for h := 0; h < oldHead; h++ {
+			pkey := fmt.Sprintf("l%d.h%d.w_pattern", li, h)
+			if _, ok := gpt.Base[pkey]; ok {
+				gpt.Base[pkey].GrowCols(newHeadDim, 0.08)
+			}
+		}
+		// Add new heads for existing layer
+		for h := oldHead; h < newHead; h++ {
+			htype := "content"
+			if h < len(newHtypes) {
+				htype = newHtypes[h]
+			}
+			if htype == "rrpram" || htype == "hybrid" {
+				gpt.Base[fmt.Sprintf("l%d.h%d.w_pattern", li, h)] = NewMatrixParam(CFG.BlockSize, newHeadDim, 0.08)
+			}
+			if htype == "hybrid" {
+				m := NewMatrixParam(1, 1, 0.0)
+				m.Rows[0].Data[0] = CFG.HybridAlphaInit
+				gpt.Base[fmt.Sprintf("l%d.h%d.alpha", li, h)] = m
+			}
+		}
+	}
+
+	// 3. Add entirely new layers
+	for li := oldLayer; li < newLayer; li++ {
+		pfx := fmt.Sprintf("l%d.", li)
+		gpt.Base[pfx+"wq"] = NewMatrixParam(newEmbd, newEmbd, 0.08)
+		gpt.Base[pfx+"wk"] = NewMatrixParam(newEmbd, newEmbd, 0.08)
+		gpt.Base[pfx+"wv"] = NewMatrixParam(newEmbd, newEmbd, 0.08)
+		gpt.Base[pfx+"wo"] = NewMatrixParam(newEmbd, newEmbd, 0.08)
+		gpt.Base[pfx+"fc_g"] = NewMatrixParam(4*newEmbd, newEmbd, 0.08)
+		gpt.Base[pfx+"fc_v"] = NewMatrixParam(4*newEmbd, newEmbd, 0.08)
+		gpt.Base[pfx+"fc2"] = NewMatrixParam(newEmbd, 4*newEmbd, 0.08)
+		for h := 0; h < newHead; h++ {
+			htype := "content"
+			if h < len(newHtypes) {
+				htype = newHtypes[h]
+			}
+			if htype == "rrpram" || htype == "hybrid" {
+				gpt.Base[fmt.Sprintf("l%d.h%d.w_pattern", li, h)] = NewMatrixParam(CFG.BlockSize, newHeadDim, 0.08)
+			}
+			if htype == "hybrid" {
+				m := NewMatrixParam(1, 1, 0.0)
+				m.Rows[0].Data[0] = CFG.HybridAlphaInit
+				gpt.Base[fmt.Sprintf("l%d.h%d.alpha", li, h)] = m
+			}
+		}
+	}
+
+	// 4. Grow delta adapters
+	r := CFG.DeltaRank
+	for _, mod := range gpt.Deltas {
+		// Grow existing layer adapters
+		for li := 0; li < oldLayer; li++ {
+			pfx := fmt.Sprintf("l%d.", li)
+			for _, name := range []string{"wq", "wk", "wv", "wo"} {
+				key := pfx + name
+				if _, ok := mod[key]; ok {
+					mod[key].GrowDims(newEmbd, newEmbd)
+				}
+			}
+			type fcSpec struct {
+				key        string
+				noutMul    int
+				ninMul     int
+			}
+			fcSpecs := []fcSpec{
+				{pfx + "fc_g", 4, 1},
+				{pfx + "fc_v", 4, 1},
+				{pfx + "fc2", 1, 4},
+			}
+			for _, spec := range fcSpecs {
+				if _, ok := mod[spec.key]; ok {
+					mod[spec.key].GrowDims(spec.noutMul*newEmbd, spec.ninMul*newEmbd)
+				}
+			}
+			for h := 0; h < oldHead; h++ {
+				pkey := fmt.Sprintf("l%d.h%d.w_pattern", li, h)
+				if _, ok := mod[pkey]; ok {
+					mod[pkey].GrowDims(CFG.BlockSize, newHeadDim)
+				}
+			}
+			for h := oldHead; h < newHead; h++ {
+				htype := "content"
+				if h < len(newHtypes) {
+					htype = newHtypes[h]
+				}
+				if htype == "rrpram" || htype == "hybrid" {
+					mod[fmt.Sprintf("l%d.h%d.w_pattern", li, h)] = NewDeltaAdapter(CFG.BlockSize, newHeadDim, r, 0.02)
+				}
+			}
+		}
+
+		// New layers: entirely new adapters
+		for li := oldLayer; li < newLayer; li++ {
+			pfx := fmt.Sprintf("l%d.", li)
+			for _, name := range []string{"wq", "wk", "wv", "wo"} {
+				mod[pfx+name] = NewDeltaAdapter(newEmbd, newEmbd, r, 0.02)
+			}
+			mod[pfx+"fc_g"] = NewDeltaAdapter(4*newEmbd, newEmbd, r, 0.02)
+			mod[pfx+"fc_v"] = NewDeltaAdapter(4*newEmbd, newEmbd, r, 0.02)
+			mod[pfx+"fc2"] = NewDeltaAdapter(newEmbd, 4*newEmbd, r, 0.02)
+			for h := 0; h < newHead; h++ {
+				htype := "content"
+				if h < len(newHtypes) {
+					htype = newHtypes[h]
+				}
+				if htype == "rrpram" || htype == "hybrid" {
+					mod[fmt.Sprintf("l%d.h%d.w_pattern", li, h)] = NewDeltaAdapter(CFG.BlockSize, newHeadDim, r, 0.02)
+				}
+			}
+		}
+
+		// lm_head adapter input grew
+		if _, ok := mod["lm_head"]; ok {
+			mod["lm_head"].GrowDims(gpt.Tok.VocabSize, newEmbd)
+		}
+	}
+
+	// 5. Update model state
+	gpt.NEmbd = newEmbd
+	gpt.NLayer = newLayer
+	gpt.NHead = newHead
+	gpt.HeadDim = newHeadDim
+	gpt.residualAlpha = 1.0 / math.Sqrt(math.Max(1, float64(newLayer)))
+
+	// 6. Update CFG runtime
+	CFG.NEmbd = newEmbd
+	CFG.NLayer = newLayer
+	CFG.NHead = newHead
+	CFG.HeadTypes = headTypesForNHead(newHead)
+
+	// 7. Reset Adam state (old momentum is meaningless after arch change)
+	gpt.Adam = make(map[string]*AdamState)
+
+	// 7b. Rebuild layerKeys for new architecture
+	gpt.layerKeys = make([]layerKeySet, newLayer)
+	for li := 0; li < newLayer; li++ {
+		pfx := fmt.Sprintf("l%d.", li)
+		lk := layerKeySet{
+			wq: pfx + "wq", wk: pfx + "wk", wv: pfx + "wv", wo: pfx + "wo",
+			fcG: pfx + "fc_g", fcV: pfx + "fc_v", fc2: pfx + "fc2",
+		}
+		nHeads := len(CFG.HeadTypes)
+		if nHeads > 0 {
+			lk.headPattern = make([]string, nHeads)
+			lk.headAlpha = make([]string, nHeads)
+			for h := 0; h < nHeads; h++ {
+				lk.headPattern[h] = fmt.Sprintf("l%d.h%d.w_pattern", li, h)
+				lk.headAlpha[h] = fmt.Sprintf("l%d.h%d.alpha", li, h)
+			}
+		}
+		gpt.layerKeys[li] = lk
+	}
+
+	// 8. Extend gamma snapshot for new embedding dimensions
+	for i := range gpt.InitEmbedSnapshot {
+		oldRow := gpt.InitEmbedSnapshot[i]
+		if len(oldRow) < newEmbd {
+			ext := make([]float64, newEmbd-len(oldRow))
+			gpt.InitEmbedSnapshot[i] = append(oldRow, ext...)
+		}
+	}
+
+	// 9. Set freeze (only train deltas until new weights stabilize)
+	gpt.growthFreezeRemaining = CFG.FreezeAfterGrowthSteps
+
+	fmt.Printf("[growth] Done. Freeze for %d steps.\n", CFG.FreezeAfterGrowthSteps)
+	return true
+}
+
 // ---- Syntropy Tracker (mathematical self-reasoning) ----
 // And lo, the organism shall not merely observe its own reflection,
 // but reason about the direction of its becoming.
@@ -1716,41 +2198,37 @@ func (gpt *GPT) ComputeFieldDeviation(tok *EvolvingTokenizer, field *CooccurFiel
 
 			// Try trigram
 			if pos >= 1 {
-				triTotal := 0.0
-				triCounts := make(map[int]float64)
-				for k, v := range field.Trigram {
-					if k[0] == ids[pos-1] && k[1] == ids[pos] {
-						triCounts[k[2]] = v
+				if ctx, ok := field.TrigramByContext[[2]int{ids[pos-1], ids[pos]}]; ok {
+					triTotal := 0.0
+					for _, v := range ctx {
 						triTotal += v
 					}
-				}
-				if triTotal > 0 {
-					for tid, cnt := range triCounts {
-						if tid < vocabSize {
-							fieldProbs[tid] = cnt / triTotal
+					if triTotal > 0 {
+						for tid, cnt := range ctx {
+							if tid < vocabSize {
+								fieldProbs[tid] = cnt / triTotal
+							}
 						}
+						fieldFound = true
 					}
-					fieldFound = true
 				}
 			}
 
 			// Fallback to bigram
 			if !fieldFound && pos >= 0 {
-				biTotal := 0.0
-				biCounts := make(map[int]float64)
-				for k, v := range field.Bigram {
-					if k[0] == ids[pos] {
-						biCounts[k[1]] = v
+				if ctx, ok := field.BigramByFirst[ids[pos]]; ok {
+					biTotal := 0.0
+					for _, v := range ctx {
 						biTotal += v
 					}
-				}
-				if biTotal > 0 {
-					for tid, cnt := range biCounts {
-						if tid < vocabSize {
-							fieldProbs[tid] = cnt / biTotal
+					if biTotal > 0 {
+						for tid, cnt := range ctx {
+							if tid < vocabSize {
+								fieldProbs[tid] = cnt / biTotal
+							}
 						}
+						fieldFound = true
 					}
-					fieldFound = true
 				}
 			}
 
@@ -1999,15 +2477,15 @@ func (gpt *GPT) ForwardStep(tokenID, posID int, keys, values [][]*Vec) *Vec {
 	x := tokEmb.Add(posEmb)
 
 	for li := 0; li < gpt.NLayer; li++ {
-		pfx := fmt.Sprintf("l%d.", li)
+		lk := gpt.layerKeys[li]
 
 		// ---- Attention ----
 		xRes := x
 		x = RMSNorm(x)
 
-		q := gpt.applyWithDeltas(pfx+"wq", x)
-		k := gpt.applyWithDeltas(pfx+"wk", x)
-		v := gpt.applyWithDeltas(pfx+"wv", x)
+		q := gpt.applyWithDeltas(lk.wq, x)
+		k := gpt.applyWithDeltas(lk.wk, x)
+		v := gpt.applyWithDeltas(lk.wv, x)
 
 		keys[li] = append(keys[li], k)
 		values[li] = append(values[li], v)
@@ -2045,7 +2523,7 @@ func (gpt *GPT) ForwardStep(tokenID, posID int, keys, values [][]*Vec) *Vec {
 			// RRPRAM attention logits
 			var rrpramLogits []*Scalar
 			if htype == "rrpram" || htype == "hybrid" {
-				patternKey := fmt.Sprintf("l%d.h%d.w_pattern", li, h)
+				patternKey := lk.headPattern[h]
 				xh := x.Slice(hs, he)
 				patternFull := gpt.applyWithDeltas(patternKey, xh)
 				rrpramLogits = make([]*Scalar, T)
@@ -2062,7 +2540,7 @@ func (gpt *GPT) ForwardStep(tokenID, posID int, keys, values [][]*Vec) *Vec {
 			case "rrpram":
 				attnWeights = ScalarSoftmax(rrpramLogits)
 			default: // hybrid
-				alphaKey := fmt.Sprintf("l%d.h%d.alpha", li, h)
+				alphaKey := lk.headAlpha[h]
 				alphaScalar := gpt.Base[alphaKey].Rows[0].Element(0) // gradient flows to MatrixParam
 				a := alphaScalar.Sigmoid()                            // learnable sigmoid gate
 				oneMinusA := a.MulF(-1.0).AddF(1.0)                  // 1 - sigmoid(alpha)
@@ -2080,19 +2558,19 @@ func (gpt *GPT) ForwardStep(tokenID, posID int, keys, values [][]*Vec) *Vec {
 		}
 
 		xAttn := Concat(headOutputs)
-		x = gpt.applyWithDeltas(pfx+"wo", xAttn)
-		x = x.Add(xRes)
+		attnOut := gpt.applyWithDeltas(lk.wo, xAttn)
+		x = xRes.Add(attnOut.Scale(gpt.residualAlpha))
 
 		// ---- Gated MLP (SwiGLU-ish) ----
 		xRes = x
 		x = RMSNorm(x)
 
-		g := gpt.applyWithDeltas(pfx+"fc_g", x).ReLU() // gate
-		u := gpt.applyWithDeltas(pfx+"fc_v", x)         // value
-		x = g.MulVec(u)                                  // gating
+		g := gpt.applyWithDeltas(lk.fcG, x).SiLU() // gate (SwiGLU)
+		u := gpt.applyWithDeltas(lk.fcV, x)         // value
+		mlpX := g.MulVec(u)                          // gating
 
-		x = gpt.applyWithDeltas(pfx+"fc2", x)
-		x = x.Add(xRes)
+		mlpOut := gpt.applyWithDeltas(lk.fc2, mlpX)
+		x = xRes.Add(mlpOut.Scale(gpt.residualAlpha))
 	}
 
 	x = RMSNorm(x)
@@ -2137,6 +2615,26 @@ func (gpt *GPT) LossOnBatch(batchIDs [][]int) *Scalar {
 	return total.MulF(1.0 / float64(len(batchIDs)))
 }
 
+// QuickLoss computes average loss on a few random docs without backward.
+// Used for self-meta-learning: measure loss before/after burst.
+func (gpt *GPT) QuickLoss(tok *EvolvingTokenizer, docs []string, n int) float64 {
+	if len(docs) == 0 {
+		return 0
+	}
+	gradEnabled = false
+	defer func() { gradEnabled = true }()
+	total := 0.0
+	for i := 0; i < n; i++ {
+		doc := docs[rand.Intn(len(docs))]
+		ids := tok.Encode(doc)
+		if len(ids) > 1 {
+			loss := gpt.LossOnSequence(ids)
+			total += loss.Data
+		}
+	}
+	return total / float64(n)
+}
+
 // GenerateSentence generates text from an optional prompt.
 // And lo, generation shall aim for a sentence, not a random cough.
 func (gpt *GPT) GenerateSentence(promptText string) string {
@@ -2171,7 +2669,7 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 	}
 
 	cur := ids[len(ids)-1]
-	var outIDs []int
+	outIDs := make([]int, 0, CFG.MaxGenTokens)
 	var recent []int
 
 	eosID := gpt.Tok.Stoi[gpt.Tok.EOS]
@@ -2184,18 +2682,18 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 		}
 		logits := gpt.ForwardStep(cur, pos, keys, values)
 
-		// Entropy-adaptive temperature
-		baseTemp := CFG.Temperature
+		// Entropy-adaptive temperature + syntropy bridge (single softmax when possible)
+		baseTemp := CFG.Temperature + gpt.syntropyTempOff
 		if baseTemp <= 1e-6 {
 			baseTemp = 1e-6
 		}
-		rawScaled := make([]float64, len(logits.Data))
+		scaled := make([]float64, len(logits.Data))
 		for i, v := range logits.Data {
-			rawScaled[i] = v / baseTemp
+			scaled[i] = v / baseTemp
 		}
-		probs0 := SoftmaxProbs(rawScaled)
+		probs := SoftmaxProbs(scaled)
 		entropy := 0.0
-		for _, p := range probs0 {
+		for _, p := range probs {
 			if p > 1e-12 {
 				entropy -= p * math.Log(p)
 			}
@@ -2206,12 +2704,59 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 		} else if entropy > CFG.EntropyHigh {
 			tMul = CFG.EntropyTempFocus
 		}
-		temp := baseTemp * tMul
-		scaled := make([]float64, len(logits.Data))
-		for i, v := range logits.Data {
-			scaled[i] = v / temp
+		if tMul != 1.0 {
+			// Only recompute softmax when temperature actually changes
+			temp := baseTemp * tMul
+			for i, v := range logits.Data {
+				scaled[i] = v / temp
+			}
+			probs = SoftmaxProbs(scaled)
 		}
-		probs := SoftmaxProbs(scaled)
+
+		// Adaptive corpus blend: corpus field fades as model becomes coherent
+		if gpt.corpusField != nil && gpt.corpusField.Built {
+			modelAlpha := 1.0 / (1.0 + math.Exp(-CFG.CorpusFadeK*(CFG.CorpusFadeThreshold-entropy)))
+			if modelAlpha < 0.99 {
+				var corpusDist map[int]float64
+				// Try trigram first
+				if len(ids) >= 2 {
+					a, b := ids[len(ids)-2], ids[len(ids)-1]
+					if ctx, ok := gpt.corpusField.TrigramByContext[[2]int{a, b}]; ok {
+						corpusDist = ctx
+					}
+				}
+				// Fallback to bigram
+				if corpusDist == nil && len(ids) >= 1 {
+					prev := ids[len(ids)-1]
+					if ctx, ok := gpt.corpusField.BigramByFirst[prev]; ok {
+						corpusDist = ctx
+					}
+				}
+				if corpusDist != nil && len(corpusDist) > 0 {
+					totalC := 0.0
+					for _, cnt := range corpusDist {
+						totalC += cnt
+					}
+					corpusProbs := make([]float64, len(probs))
+					for tid, cnt := range corpusDist {
+						if tid < len(corpusProbs) {
+							corpusProbs[tid] = cnt / totalC
+						}
+					}
+					totalB := 0.0
+					for i := range probs {
+						probs[i] = modelAlpha*probs[i] + (1.0-modelAlpha)*corpusProbs[i]
+						totalB += probs[i]
+					}
+					if totalB > 0 {
+						for i := range probs {
+							probs[i] /= totalB
+						}
+					}
+				}
+			}
+		}
+
 		nxt := TopKTopPSample(probs, CFG.TopK, CFG.TopP, CFG.MinP, CFG.TypicalP)
 
 		if nxt == eosID {
@@ -2235,15 +2780,14 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 			}
 		}
 
-		// Check for sentence ending
-		decIDs := []int{bosID}
-		decIDs = append(decIDs, outIDs...)
-		decIDs = append(decIDs, eosID)
-		textNow := gpt.Tok.Decode(decIDs)
-		if step >= CFG.MinGenTokens && len(textNow) > 0 {
-			last := textNow[len(textNow)-1]
-			if last == '.' || last == '!' || last == '?' {
-				break
+		// Check for sentence ending — decode only the last token to avoid full rebuild
+		if step >= CFG.MinGenTokens {
+			lastDecoded := gpt.Tok.Decode([]int{bosID, nxt, eosID})
+			if len(lastDecoded) > 0 {
+				lastByte := lastDecoded[len(lastDecoded)-1]
+				if lastByte == '.' || lastByte == '!' || lastByte == '?' {
+					break
+				}
 			}
 		}
 
@@ -2611,6 +3155,7 @@ type CheckpointData struct {
 	Alpha             []float64              `json:"alpha"`
 	Deltas            []map[string]DeltaJSON `json:"deltas"`
 	InitEmbedSnapshot [][]float64            `json:"init_embed_snapshot,omitempty"`
+	GlobalStep        int                    `json:"global_step"`
 }
 
 type TokenizerJSON struct {
@@ -2692,6 +3237,7 @@ func SaveCheckpoint(model *GPT, tok *EvolvingTokenizer, path string) error {
 		Alpha:             model.ActiveAlpha,
 		Deltas:            deltas,
 		InitEmbedSnapshot: model.InitEmbedSnapshot,
+		GlobalStep:        model.globalStep,
 	}
 
 	f, err := os.Create(path)
@@ -2739,11 +3285,35 @@ func LoadCheckpoint(docs []string, path string) (*GPT, *EvolvingTokenizer, error
 		if len(m) == 2 {
 			p := MergePair{m[0], m[1]}
 			tok.Merges = append(tok.Merges, p)
-			tok.MergeToTok[p] = m[0] + m[1]
+			tok.MergeToTok[p] = m[0] + "+" + m[1]
 		}
 	}
 	tok.BPEEnabled = ckpt.Tokenizer.BPEEnabled
 	tok.TrainedChars = ckpt.Tokenizer.TrainedChars
+
+	// Restore model dimensions from checkpoint config (ontogenesis may have changed them)
+	if len(ckpt.Cfg) > 0 {
+		var savedCfg struct {
+			NEmbd     int      `json:"n_embd"`
+			NLayer    int      `json:"n_layer"`
+			NHead     int      `json:"n_head"`
+			HeadTypes []string `json:"head_types"`
+		}
+		if json.Unmarshal(ckpt.Cfg, &savedCfg) == nil {
+			if savedCfg.NEmbd > 0 {
+				CFG.NEmbd = savedCfg.NEmbd
+			}
+			if savedCfg.NLayer > 0 {
+				CFG.NLayer = savedCfg.NLayer
+			}
+			if savedCfg.NHead > 0 {
+				CFG.NHead = savedCfg.NHead
+			}
+			if len(savedCfg.HeadTypes) > 0 {
+				CFG.HeadTypes = savedCfg.HeadTypes
+			}
+		}
+	}
 
 	// Restore model
 	model := NewGPT(tok)
@@ -2781,6 +3351,9 @@ func LoadCheckpoint(docs []string, path string) (*GPT, *EvolvingTokenizer, error
 			model.InitEmbedSnapshot[i] = snap
 		}
 	}
+
+	// Restore global step
+	model.globalStep = ckpt.GlobalStep
 
 	// Ensure hybrid attention weights exist (backward compat with old checkpoints)
 	for li := 0; li < CFG.NLayer; li++ {
@@ -2870,34 +3443,42 @@ func (qb *QuantumBuffer) Reset() {
 
 // And lo, the corpus shall whisper its statistics, and words shall follow words.
 type CooccurField struct {
-	Unigram  map[int]float64
-	Bigram   map[[2]int]float64
-	Trigram  map[[3]int]float64
-	Built    bool
+	Unigram          map[int]float64
+	BigramByFirst    map[int]map[int]float64    // prev → {next: count}
+	TrigramByContext map[[2]int]map[int]float64  // [prev2,prev1] → {next: count}
+	Built            bool
 }
 
 func NewCooccurField() *CooccurField {
 	return &CooccurField{
-		Unigram: make(map[int]float64),
-		Bigram:  make(map[[2]int]float64),
-		Trigram: make(map[[3]int]float64),
+		Unigram:          make(map[int]float64),
+		BigramByFirst:    make(map[int]map[int]float64),
+		TrigramByContext: make(map[[2]int]map[int]float64),
 	}
 }
 
 func (cf *CooccurField) BuildFromCorpus(tok *EvolvingTokenizer, docs []string) {
 	cf.Unigram = make(map[int]float64)
-	cf.Bigram = make(map[[2]int]float64)
-	cf.Trigram = make(map[[3]int]float64)
+	cf.BigramByFirst = make(map[int]map[int]float64)
+	cf.TrigramByContext = make(map[[2]int]map[int]float64)
 	for _, doc := range docs {
 		ids := tok.Encode(doc)
 		for _, id := range ids {
 			cf.Unigram[id]++
 		}
 		for i := 0; i < len(ids)-1; i++ {
-			cf.Bigram[[2]int{ids[i], ids[i+1]}]++
+			first, second := ids[i], ids[i+1]
+			if cf.BigramByFirst[first] == nil {
+				cf.BigramByFirst[first] = make(map[int]float64)
+			}
+			cf.BigramByFirst[first][second]++
 		}
 		for i := 0; i < len(ids)-2; i++ {
-			cf.Trigram[[3]int{ids[i], ids[i+1], ids[i+2]}]++
+			ctx := [2]int{ids[i], ids[i+1]}
+			if cf.TrigramByContext[ctx] == nil {
+				cf.TrigramByContext[ctx] = make(map[int]float64)
+			}
+			cf.TrigramByContext[ctx][ids[i+2]]++
 		}
 	}
 	cf.Built = true
@@ -2910,9 +3491,9 @@ func (cf *CooccurField) SampleNext(contextIDs []int, vocabSize int, temperature 
 	// Try trigram
 	if len(contextIDs) >= 2 {
 		a, b := contextIDs[len(contextIDs)-2], contextIDs[len(contextIDs)-1]
-		for k, v := range cf.Trigram {
-			if k[0] == a && k[1] == b {
-				counts[k[2]] += v
+		if ctx, ok := cf.TrigramByContext[[2]int{a, b}]; ok {
+			for tid, v := range ctx {
+				counts[tid] += v
 				found = true
 			}
 		}
@@ -2921,9 +3502,9 @@ func (cf *CooccurField) SampleNext(contextIDs []int, vocabSize int, temperature 
 	// Fallback to bigram
 	if !found && len(contextIDs) >= 1 {
 		prev := contextIDs[len(contextIDs)-1]
-		for k, v := range cf.Bigram {
-			if k[0] == prev {
-				counts[k[1]] += v
+		if ctx, ok := cf.BigramByFirst[prev]; ok {
+			for tid, v := range ctx {
+				counts[tid] += v
 				found = true
 			}
 		}
@@ -3050,18 +3631,22 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 		corpusTotal := 0.0
 		if len(ctxForCorpus) >= 2 {
 			a, b := ctxForCorpus[len(ctxForCorpus)-2], ctxForCorpus[len(ctxForCorpus)-1]
-			for k, v := range field.Trigram {
-				if k[0] == a && k[1] == b && int(k[2]) < tok.VocabSize {
-					corpusCounts[k[2]] += v
-					corpusTotal += v // And lo, the trigram shall be counted properly
+			if ctx, ok := field.TrigramByContext[[2]int{a, b}]; ok {
+				for tid, v := range ctx {
+					if tid < tok.VocabSize {
+						corpusCounts[tid] += v
+						corpusTotal += v // And lo, the trigram shall be counted properly
+					}
 				}
 			}
 		}
 		if corpusTotal == 0 && len(ctxForCorpus) >= 1 {
 			prev := ctxForCorpus[len(ctxForCorpus)-1]
-			for k, v := range field.Bigram {
-				if k[0] == prev && int(k[1]) < tok.VocabSize {
-					corpusCounts[k[1]] += v
+			if ctx, ok := field.BigramByFirst[prev]; ok {
+				for tid, v := range ctx {
+					if tid < tok.VocabSize {
+						corpusCounts[tid] += v
+					}
 				}
 			}
 		}
@@ -3128,10 +3713,22 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 // And lo, the organism shall not merely track its changes,
 // but reason mathematically about whether it is becoming more itself.
 
+// BurstRecord stores what happened after a training burst — for self-meta-learning.
+type BurstRecord struct {
+	Action     string
+	LossBefore float64
+	LossAfter  float64
+}
+
 // SyntropyTracker is the mathematical self-reasoning engine.
 // Tracks entropy trend, field deviation, purpose alignment.
 // Makes decisions about learning direction — not just 'did I learn?'
 // but 'should I keep going this way?'
+// SwarmPeerInfo holds peer information from mesh.db.
+type SwarmPeerInfo struct {
+	Peers []map[string]interface{}
+}
+
 type SyntropyTracker struct {
 	EntropyHistory   []float64 // rolling window of model entropy
 	SyntropyTrend    float64   // positive = organizing, negative = dissolving
@@ -3139,6 +3736,10 @@ type SyntropyTracker struct {
 	PurposeMagnitude float64   // strength of current learning direction
 	PurposeAlignment float64   // cosine(purpose, gamma)
 	LastAction       string    // what was decided last time
+	BurstHistory     []BurstRecord // last 16 burst outcomes — training efficiency memory
+	ModelStage       int       // current growth stage (set during measure)
+	LastMitosisTime  float64   // cooldown for divide
+	SwarmInfo        *SwarmPeerInfo // peer state from mesh.db (set externally)
 }
 
 // NewSyntropyTracker creates a new tracker with sane defaults.
@@ -3147,6 +3748,32 @@ func NewSyntropyTracker() *SyntropyTracker {
 	return &SyntropyTracker{
 		LastAction: "none",
 	}
+}
+
+// RecordBurst logs a burst outcome for self-meta-learning.
+// The organism remembers what worked and what didn't.
+func (st *SyntropyTracker) RecordBurst(action string, lossBefore, lossAfter float64) {
+	st.BurstHistory = append(st.BurstHistory, BurstRecord{action, lossBefore, lossAfter})
+	if len(st.BurstHistory) > 16 {
+		st.BurstHistory = st.BurstHistory[len(st.BurstHistory)-16:]
+	}
+}
+
+// ActionEffectiveness returns the mean loss delta for a given action type.
+// Negative = good (loss went down). Positive = bad (loss went up).
+func (st *SyntropyTracker) ActionEffectiveness(action string) (float64, int) {
+	sum := 0.0
+	count := 0
+	for _, br := range st.BurstHistory {
+		if br.Action == action {
+			sum += br.LossAfter - br.LossBefore
+			count++
+		}
+	}
+	if count == 0 {
+		return 0, 0
+	}
+	return sum / float64(count), count
 }
 
 // SyntropyMetrics holds the result of a syntropy measurement pass.
@@ -3161,6 +3788,7 @@ type SyntropyMetrics struct {
 // Measure takes all measurements. This is the organism looking at itself
 // through mathematical instruments.
 func (st *SyntropyTracker) Measure(model *GPT, tok *EvolvingTokenizer, field *CooccurField, docs []string) SyntropyMetrics {
+	st.ModelStage = model.CurrentGrowthStage()
 	entropyNow := model.ComputeModelEntropy(tok, docs, 16)
 	st.EntropyHistory = append(st.EntropyHistory, entropyNow)
 	if len(st.EntropyHistory) > CFG.SyntropyWindow {
@@ -3202,8 +3830,11 @@ func (st *SyntropyTracker) Measure(model *GPT, tok *EvolvingTokenizer, field *Co
 }
 
 // SyntropyDecision holds the outcome of the organism's mathematical self-reasoning.
+// Not just LR anymore — the organism modulates its entire behavior.
 type SyntropyDecision struct {
 	LRMultiplier      float64
+	TempOffset        float64  // added to generation temperature (-0.05 to +0.05)
+	AccumOverride     int      // 0 = no override, >0 = use this accum_steps for this burst
 	DeltaGrowOverride *float64 // nil = no override
 	Action            string
 }
@@ -3214,6 +3845,8 @@ type SyntropyDecision struct {
 func (st *SyntropyTracker) DecideAction() SyntropyDecision {
 	// Default: steady state
 	lrMultiplier := 1.0
+	tempOffset := 0.0
+	accumOverride := 0
 	var deltaGrowOverride *float64
 	action := "steady"
 
@@ -3222,39 +3855,78 @@ func (st *SyntropyTracker) DecideAction() SyntropyDecision {
 		st.FieldDeviation > CFG.FieldDeviationFloor &&
 		st.FieldDeviation < CFG.FieldDeviationCeiling {
 		lrMultiplier = CFG.SyntropyLRBoost
+		tempOffset = -0.05 // more confident when organizing
 		if st.PurposeAlignment > 0.3 {
 			boost := CFG.SyntropyDeltaGrowBoost
 			deltaGrowOverride = &boost
-			action = "amplify" // everything aligned, push harder
+			accumOverride = 2 // stable gradient when everything aligned
+			action = "amplify"
 		} else {
-			action = "boost" // syntropy good but purpose drifting, boost gently
+			action = "boost"
 		}
 
 		// CASE 2: Syntropy falling = dissolving, slow down
 	} else if st.SyntropyTrend < -0.01 {
 		lrMultiplier = CFG.SyntropyLRDampen
-		action = "dampen" // losing order, reduce learning rate
+		tempOffset = 0.05 // more exploratory when disordering
+		action = "dampen"
 
 		// CASE 3: Field deviation too high = hallucinating
 	} else if st.FieldDeviation > CFG.FieldDeviationCeiling {
 		lrMultiplier = CFG.SyntropyLRDampen
-		action = "ground" // too far from corpus, pull back
+		tempOffset = -0.05 // focus when hallucinating
+		action = "ground"
 
 		// CASE 4: Field deviation too low = parroting
 	} else if st.FieldDeviation < CFG.FieldDeviationFloor {
 		lrMultiplier = CFG.SyntropyLRBoost
-		action = "explore" // too close to corpus, push out
+		tempOffset = 0.05 // explore when parroting
+		action = "explore"
 	}
 
 	// CASE 5: Purpose opposes gamma = identity crisis
 	if st.PurposeAlignment < -0.3 {
 		lrMultiplier *= 0.5
-		action = "realign" // learning against identity, slow down hard
+		tempOffset = 0.0 // neutral temp during identity crisis
+		action = "realign"
+	}
+
+	// CASE 6: Adult + sustained overload → divide (mitosis)
+	maxStage := len(CFG.GrowthStages) - 1
+	now := float64(time.Now().UnixMilli()) / 1000.0
+	if st.ModelStage >= maxStage &&
+		st.isSustainedOverload() &&
+		now-st.LastMitosisTime > 300 {
+		action = "divide"
+		lrMultiplier = CFG.SyntropyLRDampen // slow down while preparing to split
+	}
+
+	// CASE 7: Plateau + young peer thriving → hibernate (cooperative scheduling)
+	if action == "steady" && st.shouldHibernate() {
+		action = "hibernate"
+	}
+
+	// SELF-META-LEARNING: check if this action historically hurts
+	if action != "divide" && action != "hibernate" && len(st.BurstHistory) >= 4 {
+		eff, count := st.ActionEffectiveness(action)
+		if count >= 2 && eff > 0.05 {
+			// This action has been consistently making loss WORSE — downgrade
+			if action == "amplify" {
+				action = "boost"
+				accumOverride = 0
+				deltaGrowOverride = nil
+			} else if action == "boost" || action == "explore" {
+				lrMultiplier = 1.0 // back to steady instead of boosting
+				action = "steady"
+			}
+		}
 	}
 
 	st.LastAction = action
 	return SyntropyDecision{
 		LRMultiplier:      lrMultiplier,
+		TempOffset:        tempOffset,
+		AccumOverride:     accumOverride,
 		DeltaGrowOverride: deltaGrowOverride,
 		Action:            action,
 	}
@@ -3274,6 +3946,288 @@ func (st *SyntropyTracker) LogToDB(db *sql.DB, entropyBefore, entropyAfter float
 		action, nil)
 }
 
+// isSustainedOverload returns true when >75% of entropy_history is above entropy_high AND syntropy_trend < -0.02.
+func (st *SyntropyTracker) isSustainedOverload() bool {
+	if len(st.EntropyHistory) < CFG.SyntropyWindow {
+		return false
+	}
+	recent := st.EntropyHistory[len(st.EntropyHistory)-CFG.SyntropyWindow:]
+	highCount := 0
+	for _, e := range recent {
+		if e > CFG.EntropyHigh {
+			highCount++
+		}
+	}
+	return highCount > int(float64(CFG.SyntropyWindow)*0.75) && st.SyntropyTrend < -0.02
+}
+
+// shouldHibernate returns true if a peer has syntropy > 0.05 AND this organism's last 8 burst deltas avg < 0.01.
+func (st *SyntropyTracker) shouldHibernate() bool {
+	if st.SwarmInfo == nil || len(st.SwarmInfo.Peers) == 0 {
+		return false
+	}
+	// Check if any peer has higher syntropy trend (actively improving)
+	for _, peer := range st.SwarmInfo.Peers {
+		synVal, ok := peer["syntropy"]
+		if !ok {
+			continue
+		}
+		synFloat, _ := synVal.(float64)
+		if synFloat > 0.05 {
+			// A young peer is thriving. If we're stale, hibernate.
+			if len(st.BurstHistory) >= 8 {
+				sum := 0.0
+				for _, b := range st.BurstHistory[len(st.BurstHistory)-8:] {
+					sum += b.LossAfter - b.LossBefore
+				}
+				avgDelta := sum / 8.0
+				if math.Abs(avgDelta) < 0.01 { // loss plateau
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// ============================================================
+// 9.7) SWARM ECOLOGY — the organism learns it is not alone
+// ============================================================
+// And lo, the first cell shall call into the void and hear only silence.
+// But the second shall call and hear an answer.
+
+var swarmDir = filepath.Join(os.Getenv("HOME"), ".molecule", "swarm")
+
+// SwarmRegistry discovers and tracks other molecule instances via shared SQLite.
+type SwarmRegistry struct {
+	OrganismID string
+	PidFile    string
+	MeshDB     *sql.DB
+}
+
+// NewSwarmRegistry creates a new SwarmRegistry with the given organism ID, or generates one.
+func NewSwarmRegistry(organismID string) *SwarmRegistry {
+	if organismID == "" {
+		organismID = fmt.Sprintf("org_%d_%d", os.Getpid(), time.Now().Unix())
+	}
+	return &SwarmRegistry{OrganismID: organismID}
+}
+
+// Register writes PID file and registers in mesh.db.
+func (sr *SwarmRegistry) Register() error {
+	if err := os.MkdirAll(swarmDir, 0755); err != nil {
+		return err
+	}
+	sr.PidFile = filepath.Join(swarmDir, sr.OrganismID+".pid")
+	pidData, _ := json.Marshal(map[string]interface{}{
+		"pid":         os.Getpid(),
+		"organism_id": sr.OrganismID,
+		"started":     float64(time.Now().UnixMilli()) / 1000.0,
+	})
+	if err := os.WriteFile(sr.PidFile, pidData, 0644); err != nil {
+		return err
+	}
+	if err := sr.initMeshDB(); err != nil {
+		return err
+	}
+	return sr.registerInMesh()
+}
+
+func (sr *SwarmRegistry) initMeshDB() error {
+	dbPath := filepath.Join(swarmDir, "mesh.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return err
+	}
+	db.Exec("PRAGMA journal_mode=WAL")
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS organisms(
+		id TEXT PRIMARY KEY, pid INTEGER, stage INTEGER,
+		n_params INTEGER, syntropy REAL, entropy REAL,
+		last_heartbeat REAL, parent_id TEXT,
+		status TEXT DEFAULT 'alive')`)
+	if err != nil {
+		db.Close()
+		return err
+	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS messages(
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		from_id TEXT, to_id TEXT, type TEXT, payload TEXT, ts REAL)`)
+	if err != nil {
+		db.Close()
+		return err
+	}
+	sr.MeshDB = db
+	return nil
+}
+
+func (sr *SwarmRegistry) registerInMesh() error {
+	if sr.MeshDB == nil {
+		return nil
+	}
+	_, err := sr.MeshDB.Exec(
+		"INSERT OR REPLACE INTO organisms(id,pid,stage,n_params,syntropy,entropy,last_heartbeat,status) "+
+			"VALUES(?,?,0,0,0.0,0.0,?,'alive')",
+		sr.OrganismID, os.Getpid(), float64(time.Now().UnixMilli())/1000.0)
+	return err
+}
+
+// Heartbeat performs periodic state update in mesh.db.
+func (sr *SwarmRegistry) Heartbeat(stage, nParams int, syntropy, entropy float64) {
+	if sr.MeshDB == nil {
+		return
+	}
+	sr.MeshDB.Exec(
+		"UPDATE organisms SET stage=?,n_params=?,syntropy=?,entropy=?,last_heartbeat=?,status='alive' WHERE id=?",
+		stage, nParams, syntropy, entropy, float64(time.Now().UnixMilli())/1000.0, sr.OrganismID)
+}
+
+// DiscoverPeers finds other living organisms.
+func (sr *SwarmRegistry) DiscoverPeers(timeoutSeconds float64) []map[string]interface{} {
+	if sr.MeshDB == nil {
+		return nil
+	}
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 60
+	}
+	cutoff := float64(time.Now().UnixMilli())/1000.0 - timeoutSeconds
+	rows, err := sr.MeshDB.Query(
+		"SELECT id,pid,stage,n_params,syntropy,entropy,status FROM organisms "+
+			"WHERE status='alive' AND last_heartbeat>? AND id!=?",
+		cutoff, sr.OrganismID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var peers []map[string]interface{}
+	for rows.Next() {
+		var id, status string
+		var pid, stage, nParams int
+		var syntropy, entropy float64
+		rows.Scan(&id, &pid, &stage, &nParams, &syntropy, &entropy, &status)
+		peers = append(peers, map[string]interface{}{
+			"id": id, "pid": pid, "stage": stage, "n_params": nParams,
+			"syntropy": syntropy, "entropy": entropy, "status": status,
+		})
+	}
+	return peers
+}
+
+// MarkHibernating marks this organism as sleeping in mesh.db.
+func (sr *SwarmRegistry) MarkHibernating() {
+	if sr.MeshDB != nil {
+		sr.MeshDB.Exec("UPDATE organisms SET status='sleeping' WHERE id=?", sr.OrganismID)
+	}
+}
+
+// LogMessage logs a message between organisms.
+func (sr *SwarmRegistry) LogMessage(toID, msgType string, payload interface{}) {
+	if sr.MeshDB != nil {
+		payloadJSON, _ := json.Marshal(payload)
+		sr.MeshDB.Exec(
+			"INSERT INTO messages(from_id,to_id,type,payload,ts) VALUES(?,?,?,?,?)",
+			sr.OrganismID, toID, msgType, string(payloadJSON),
+			float64(time.Now().UnixMilli())/1000.0)
+	}
+}
+
+// Unregister cleans up on exit.
+func (sr *SwarmRegistry) Unregister() {
+	if sr.MeshDB != nil {
+		sr.MeshDB.Exec("UPDATE organisms SET status='dead' WHERE id=?", sr.OrganismID)
+		sr.MeshDB.Close()
+		sr.MeshDB = nil
+	}
+	if sr.PidFile != "" {
+		os.Remove(sr.PidFile)
+	}
+}
+
+// performMitosis divides the organism. Parent continues. Child starts at infant stage.
+func performMitosis(model *GPT, tok *EvolvingTokenizer, db *sql.DB, swarm *SwarmRegistry, syntracker *SyntropyTracker) (string, error) {
+	childID := fmt.Sprintf("org_%d_%d", time.Now().Unix(), rand.Intn(9000)+1000)
+	childDir := filepath.Join(os.Getenv("HOME"), ".molecule", childID)
+	if err := os.MkdirAll(childDir, 0755); err != nil {
+		return "", err
+	}
+
+	// Save parent checkpoint for child's reference
+	parentCkpt := filepath.Join(childDir, "parent_ckpt.json")
+	if err := SaveCheckpoint(model, tok, parentCkpt); err != nil {
+		return "", err
+	}
+
+	// Write birth config with inherited memory
+	birth := map[string]interface{}{
+		"organism_id":   childID,
+		"parent_id":     swarm.OrganismID,
+		"corpus_path":   CFG.CorpusPath,
+		"db_path":       filepath.Join(childDir, "memory.sqlite3"),
+		"ckpt_path":     filepath.Join(childDir, "molecule_ckpt.json"),
+		"burst_history": syntracker.BurstHistory,
+	}
+	birthPath := filepath.Join(childDir, "birth.json")
+	birthJSON, _ := json.Marshal(birth)
+	if err := os.WriteFile(birthPath, birthJSON, 0644); err != nil {
+		return "", err
+	}
+
+	// Log in mesh
+	swarm.LogMessage(childID, "mitosis:spawn",
+		map[string]interface{}{"parent_stage": model.CurrentGrowthStage()})
+	dbLogGrowth(db, model, tok, loadCorpusLines(CFG.CorpusPath), 0.0,
+		fmt.Sprintf("mitosis:spawn:%s", childID))
+
+	// Spawn child process
+	exePath, err := os.Executable()
+	if err != nil {
+		exePath = os.Args[0]
+	}
+	cmd := exec.Command(exePath, "--organism-id", childID, "--config", birthPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+
+	syntracker.LastMitosisTime = float64(time.Now().UnixMilli()) / 1000.0
+	fmt.Printf("[ecology] Child %s spawned (pid=%d)\n", childID, cmd.Process.Pid)
+	return childID, nil
+}
+
+// performHibernation saves state, marks sleeping, and signals exit.
+func performHibernation(model *GPT, tok *EvolvingTokenizer, db *sql.DB, swarm *SwarmRegistry) {
+	fmt.Printf("[ecology] HIBERNATION — organism %s going to sleep\n", swarm.OrganismID)
+	SaveCheckpoint(model, tok, "")
+	swarm.MarkHibernating()
+	dbLogGrowth(db, model, tok, loadCorpusLines(CFG.CorpusPath), 0.0,
+		fmt.Sprintf("hibernate:%s", swarm.OrganismID))
+}
+
+// parseCLIArgs parses --organism-id and --config from os.Args.
+func parseCLIArgs() (organismID string, configPath string) {
+	for i := 1; i < len(os.Args); i++ {
+		if os.Args[i] == "--organism-id" && i+1 < len(os.Args) {
+			organismID = os.Args[i+1]
+			i++
+		} else if os.Args[i] == "--config" && i+1 < len(os.Args) {
+			configPath = os.Args[i+1]
+			i++
+		}
+	}
+	return
+}
+
+// cosineLR returns learning rate for the given global step using cosine schedule with linear warmup.
+func cosineLR(globalStep int) float64 {
+	if globalStep < CFG.CosineWarmupSteps {
+		// Linear warmup from LRMin to LearningRate
+		t := float64(globalStep) / math.Max(1, float64(CFG.CosineWarmupSteps))
+		return CFG.LRMin + (CFG.LearningRate-CFG.LRMin)*t
+	}
+	progress := math.Min(1.0, float64(globalStep)/math.Max(1, float64(CFG.MaxTotalSteps)))
+	return CFG.LRMin + 0.5*(CFG.LearningRate-CFG.LRMin)*(1.0+math.Cos(math.Pi*progress))
+}
+
 func trainSteps(model *GPT, tok *EvolvingTokenizer, docs []string, steps int, trainBase, trainDeltas bool) {
 	if len(docs) == 0 {
 		return
@@ -3282,32 +4236,59 @@ func trainSteps(model *GPT, tok *EvolvingTokenizer, docs []string, steps int, tr
 	model.mu.Lock()
 	defer model.mu.Unlock()
 
+	// Ontogenesis freeze: after growth, only train deltas until new weights stabilize
 	var baseParams []*Vec
-	if trainBase {
-		baseParams = model.AllBaseParams()
-	}
 	var deltaParams []*Vec
-	if trainDeltas {
-		deltaParams = model.AllDeltaParams()
+	if model.growthFreezeRemaining > 0 {
+		// Freeze base, only train deltas
+		if trainDeltas {
+			deltaParams = model.AllDeltaParams()
+		}
+		model.growthFreezeRemaining -= steps
+		if model.growthFreezeRemaining < 0 {
+			model.growthFreezeRemaining = 0
+		}
+	} else {
+		if trainBase {
+			baseParams = model.AllBaseParams()
+		}
+		if trainDeltas {
+			deltaParams = model.AllDeltaParams()
+		}
+	}
+
+	accum := CFG.AccumSteps
+	if accum < 1 {
+		accum = 1
 	}
 
 	for step := 0; step < steps; step++ {
-		// Sample batch
-		batch := make([]string, CFG.BatchSize)
-		for i := range batch {
-			batch[i] = docs[rand.Intn(len(docs))]
-		}
-		var batchIDs [][]int
-		for _, doc := range batch {
-			if doc != "" {
-				batchIDs = append(batchIDs, tok.Encode(doc))
+		// Gradient accumulation: accumulate over accum micro-batches, then step
+		var lastLossVal float64
+		for micro := 0; micro < accum; micro++ {
+			batch := make([]string, CFG.BatchSize)
+			for i := range batch {
+				batch[i] = docs[rand.Intn(len(docs))]
 			}
+			var batchIDs [][]int
+			for _, doc := range batch {
+				if doc != "" {
+					batchIDs = append(batchIDs, tok.Encode(doc))
+				}
+			}
+
+			loss := model.LossOnBatch(batchIDs)
+			// Scale loss for accumulation
+			if accum > 1 {
+				loss = loss.MulF(1.0 / float64(accum))
+			}
+			Backward(loss)
+			lastLossVal = loss.Data * float64(accum) // unscaled for display
 		}
 
-		loss := model.LossOnBatch(batchIDs)
-		Backward(loss)
+		lr := cosineLR(model.globalStep)
+		model.globalStep++
 
-		lr := CFG.LearningRate * (1.0 - float64(step)/math.Max(1, float64(steps)))
 		if len(baseParams) > 0 {
 			model.AdamStep(baseParams, "base", lr)
 		}
@@ -3316,16 +4297,25 @@ func trainSteps(model *GPT, tok *EvolvingTokenizer, docs []string, steps int, tr
 		}
 
 		if step%100 == 0 {
-			fmt.Printf("  train step %d/%d | loss %.4f\n", step, steps, loss.Data)
+			fmt.Printf("  train step %d/%d | loss %.4f | lr %.5f\n", step, steps, lastLossVal, lr)
 		}
 	}
 }
 
-func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *QuantumBuffer, stop chan struct{}) {
+func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *QuantumBuffer, swarm *SwarmRegistry, stop chan struct{}) {
 	// And lo, asynchronous training shall occur, because sleeping is for humans.
 	warmedUp := false
 	syntracker := NewSyntropyTracker()
 	field := NewCooccurField()
+	tickCount := 0
+
+	// Inherit burst_history from parent (mitosis lineage)
+	if len(model.inheritedBurstHistory) > 0 {
+		syntracker.BurstHistory = make([]BurstRecord, len(model.inheritedBurstHistory))
+		copy(syntracker.BurstHistory, model.inheritedBurstHistory)
+		fmt.Printf("[ecology] syntracker inherited %d burst records from parent.\n", len(model.inheritedBurstHistory))
+		model.inheritedBurstHistory = nil
+	}
 
 	for {
 		select {
@@ -3334,12 +4324,15 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 		default:
 		}
 
+		tickCount++
+
 		updateReservoirCorpus(db, CFG.CorpusPath, CFG.MaxCorpusLines)
 		docs := loadCorpusLines(CFG.CorpusPath)
 
 		// Rebuild field from current corpus (the organism re-reads its own physics)
 		if len(docs) > 0 {
 			field.BuildFromCorpus(tok, docs)
+			model.corpusField = field // share with GenerateSentence for adaptive blend
 		}
 
 		// Tokenizer evolution
@@ -3385,16 +4378,33 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 			deltaSnap := model.SnapshotDeltas()
 			model.mu.Unlock()
 
-			// Apply syntropy-adjusted learning rate
+			// Apply syntropy-adjusted learning rate + accum override
 			originalLR := CFG.LearningRate
 			CFG.LearningRate = originalLR * lrMul
+			originalAccum := CFG.AccumSteps
+			if decision.AccumOverride > 0 {
+				CFG.AccumSteps = decision.AccumOverride
+			}
+
+			// Update temperature bridge (thread-safe via model lock already released)
+			model.syntropyTempOff = decision.TempOffset
+
+			// Measure loss before burst for self-meta-learning
+			lossBefore := model.QuickLoss(tok, docs, 4)
 
 			trainBase := !CFG.FreezeBaseAfterWarm
 			trainSteps(model, tok, docs, CFG.MicroSteps, trainBase, true)
 
-			CFG.LearningRate = originalLR // restore, like a gentleman
+			CFG.LearningRate = originalLR   // restore
+			CFG.AccumSteps = originalAccum  // restore
 
 			model.mu.Lock()
+			// Measure loss after burst
+			lossAfter := model.QuickLoss(tok, docs, 4)
+
+			// SELF-META-LEARNING: record what this burst did
+			syntracker.RecordBurst(action, lossBefore, lossAfter)
+
 			// IMMUNE SYSTEM: check drift after burst
 			driftCos := model.GammaDriftCheck(preDirection, preMag)
 			if driftCos < CFG.NoiseDriftThreshold {
@@ -3408,7 +4418,8 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 				entropyAfter := postMetrics.Entropy
 				syntracker.LogToDB(db, entropyBefore, entropyAfter, action)
 				SaveCheckpoint(model, tok, "")
-				dbLogGrowth(db, model, tok, docs, 0.0, fmt.Sprintf("quantum_burst:%s", action))
+				note := fmt.Sprintf("quantum_burst:%s|Δloss=%.4f", action, lossAfter-lossBefore)
+				dbLogGrowth(db, model, tok, docs, 0.0, note)
 			}
 			model.mu.Unlock()
 
@@ -3427,6 +4438,56 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 				model.mu.Unlock()
 				SaveCheckpoint(model, tok, "")
 			}
+
+			// Ontogenesis: check if architecture should grow
+			corpusChars := 0
+			for _, d := range docs {
+				corpusChars += len(d)
+			}
+			model.mu.Lock()
+			if model.MaybeGrowArchitecture(corpusChars) {
+				SaveCheckpoint(model, tok, "")
+				nP := 0
+				for _, m := range model.Base {
+					nP += m.Nout * m.Nin
+				}
+				dbLogGrowth(db, model, tok, docs, 0.0,
+					fmt.Sprintf("ontogenesis:stage=%d|params=%d", model.CurrentGrowthStage(), nP))
+			}
+			model.mu.Unlock()
+
+			// Ecology: mitosis / hibernation
+			if swarm != nil && action == "divide" {
+				fmt.Println("[ecology] MITOSIS triggered — organism overloaded, spawning child")
+				model.mu.Lock()
+				performMitosis(model, tok, db, swarm, syntracker)
+				model.mu.Unlock()
+			}
+
+			if swarm != nil && action == "hibernate" {
+				model.mu.Lock()
+				performHibernation(model, tok, db, swarm)
+				model.mu.Unlock()
+				fmt.Println("[ecology] Organism hibernating. Goodbye.")
+				return // exit training loop
+			}
+		}
+
+		// Swarm heartbeat (every 10 ticks)
+		if swarm != nil && tickCount%10 == 0 {
+			stage := model.CurrentGrowthStage()
+			nP := 0
+			for _, m := range model.Base {
+				nP += m.Nout * m.Nin
+			}
+			lastEntropy := 0.0
+			if len(syntracker.EntropyHistory) > 0 {
+				lastEntropy = syntracker.EntropyHistory[len(syntracker.EntropyHistory)-1]
+			}
+			swarm.Heartbeat(stage, nP, syntracker.SyntropyTrend, lastEntropy)
+			// Update swarm info for hibernate decisions
+			peers := swarm.DiscoverPeers(60)
+			syntracker.SwarmInfo = &SwarmPeerInfo{Peers: peers}
 		}
 
 		time.Sleep(time.Duration(CFG.TrainTickSeconds * float64(time.Second)))
@@ -3477,6 +4538,49 @@ func buildPromptFromMemory(db *sql.DB, userText string) string {
 func main() {
 	rand.Seed(42) // And lo, determinism shall pretend to tame chaos.
 
+	// Parse CLI args for child organisms
+	organismID, configPath := parseCLIArgs()
+
+	// Child organism: load birth config from parent
+	var syntrackerSeed []BurstRecord
+	if configPath != "" {
+		if data, err := os.ReadFile(configPath); err == nil {
+			var birth map[string]interface{}
+			if json.Unmarshal(data, &birth) == nil {
+				if cp, ok := birth["corpus_path"].(string); ok && cp != "" {
+					CFG.CorpusPath = cp
+				}
+				if dp, ok := birth["db_path"].(string); ok && dp != "" {
+					CFG.DBPath = dp
+				}
+				if ckp, ok := birth["ckpt_path"].(string); ok && ckp != "" {
+					CFG.CkptPath = ckp
+				}
+				// Parse burst_history
+				if bh, ok := birth["burst_history"].([]interface{}); ok {
+					for _, item := range bh {
+						if rec, ok := item.(map[string]interface{}); ok {
+							br := BurstRecord{}
+							if a, ok := rec["Action"].(string); ok {
+								br.Action = a
+							}
+							if lb, ok := rec["LossBefore"].(float64); ok {
+								br.LossBefore = lb
+							}
+							if la, ok := rec["LossAfter"].(float64); ok {
+								br.LossAfter = la
+							}
+							syntrackerSeed = append(syntrackerSeed, br)
+						}
+					}
+					if len(syntrackerSeed) > 0 {
+						fmt.Printf("[ecology] Inherited %d burst records from parent.\n", len(syntrackerSeed))
+					}
+				}
+			}
+		}
+	}
+
 	db, err := initDB(CFG.DBPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
@@ -3491,6 +4595,7 @@ func main() {
 
 	docs := loadCorpusLines(CFG.CorpusPath)
 
+	// Restore model dimensions from checkpoint config (ontogenesis may have changed them)
 	model, tok, err := LoadCheckpoint(docs, "")
 	if err != nil || model == nil || tok == nil {
 		if len(docs) == 0 {
@@ -3502,6 +4607,23 @@ func main() {
 
 	model.MaybeExpandVocab(tok.VocabSize)
 
+	// Swarm ecology: register in mesh
+	swarm := NewSwarmRegistry(organismID)
+	if err := swarm.Register(); err != nil {
+		fmt.Printf("[ecology] Warning: swarm registration failed: %v\n", err)
+	}
+	peers := swarm.DiscoverPeers(60)
+	if len(peers) > 0 {
+		fmt.Printf("[ecology] Joined swarm. %d peer(s) detected.\n", len(peers))
+	} else {
+		fmt.Println("[ecology] First organism in the swarm.")
+	}
+
+	// Child: inject inherited burst_history via model attribute
+	if len(syntrackerSeed) > 0 {
+		model.inheritedBurstHistory = syntrackerSeed
+	}
+
 	// Build corpus field for pre-training speech
 	cooccur := NewCooccurField()
 	cooccur.BuildFromCorpus(tok, docs)
@@ -3511,7 +4633,7 @@ func main() {
 
 	// Start background trainer
 	stop := make(chan struct{})
-	go backgroundTrainer(db, model, tok, qbuf, stop)
+	go backgroundTrainer(db, model, tok, qbuf, swarm, stop)
 
 	fmt.Println("molecule is alive. Type and press Enter. Ctrl+C to exit.")
 
@@ -3550,4 +4672,5 @@ func main() {
 
 	close(stop)
 	SaveCheckpoint(model, tok, "")
+	swarm.Unregister()
 }
