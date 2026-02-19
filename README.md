@@ -35,6 +35,8 @@ THIS IS:
 - Corpus field: speaks before it learns (trigram statistics)
 - QuantumBuffer: trains when it's ready, not when you tell it
 - SyntropyTracker: mathematical self-reasoning about its own becoming
+- Swarm ecology: mitosis (cell division) + hibernation (cooperative scheduling)
+- Swarm mesh: organisms discover each other via shared SQLite mesh.db
 - Entropy-adaptive temperature (no more max-prob hacks)
 - Growth table: SQLite/IndexedDB structural autobiography
 - Native immune system: detects and rejects identity-corrupting noise
@@ -58,7 +60,10 @@ What if it grew a personality from scratch? **Native gamma.**
 What if it could speak before training? **Corpus field.**
 What if it started as a 25K embryo and grew to 10M? **Ontogenesis.**
 What if it could reason about its own learning? **SyntropyTracker.**
-What if it was *alive*?  
+What if it divided when overloaded? **Mitosis.**
+What if it slept so a younger cell could learn? **Hibernation.**
+What if they formed a swarm? **Mesh ecology.**
+What if it was *alive*?
 
 So meet **molecule**. Thanks to Karpathy's microgpt, but this is not a fork.
 
@@ -382,6 +387,41 @@ This is not heuristics — it's **mathematical introspection**. The organism mea
 
 Every decision is logged to the syntropy_log table with full metrics.
 
+### 16. Swarm Ecology (Mitosis + Hibernation)
+
+The organism is not alone. When it reaches adult stage and hits sustained overload, it **divides** — spawning a child organism at infant stage. Both train independently on the same corpus but grow through different paths.
+
+```python
+# SyntropyTracker detects overload → "divide" action
+# Conditions: adult stage + entropy high for >75% of window + falling syntropy + 300s cooldown
+if model_stage == adult and sustained_overload and cooldown_expired:
+    action = "divide"
+
+# perform_mitosis():
+# 1. Save parent checkpoint
+# 2. Create ~/.molecule/org_NNNN/ with birth.json
+# 3. Child inherits burst_history (training efficiency memory)
+# 4. Spawn child as subprocess
+# 5. Both continue independently
+```
+
+**Hibernation** is cooperative, not resource-based. When an organism is on a loss plateau and a peer is actively thriving (syntropy > 0.05), it voluntarily sleeps:
+
+```python
+# _should_hibernate():
+# - A peer has syntropy > 0.05 (actively improving)
+# - Our last 8 bursts show |avg_delta| < 0.01 (plateau)
+# → Go to sleep. Give the training flow to the young cell.
+```
+
+The **SwarmRegistry** is shared SQLite (`~/.molecule/swarm/mesh.db`, WAL mode):
+- `organisms` table: id, pid, stage, n_params, syntropy, entropy, status (alive/sleeping/dead)
+- `messages` table: inter-organism communication log
+- Heartbeat every 10 training ticks
+- `discover_peers()` finds other living organisms
+
+This is not load balancing. It's **ecological optimization** — organisms that need to learn get priority, organisms that have plateaued yield. The field of answers remains shared.
+
 ---
 
 ## The Stack
@@ -403,6 +443,7 @@ Every decision is logged to the syntropy_log table with full metrics.
 | Growth tracking | None | **SQLite growth table** |
 | Noise rejection | None | **Native immune system** (γ drift + delta rollback) |
 | Self-reasoning | None | **SyntropyTracker** (entropy trend + field deviation + purpose alignment) |
+| Ecology | None | **Swarm** (mitosis + hibernation + mesh.db) |
 | Residual scaling | No | **α = 1/√n_layers** |
 | LR schedule | Fixed | **Global cosine + linear warmup** |
 | Grad accumulation | No | **Configurable (scales with growth)** |
@@ -494,7 +535,7 @@ The same architecture, four languages, four habitats:
 | **molecule.c** | `molecule.c` | C99 | `sqlite3`, `pthreads` | Terminal. Arena allocator, binary checkpoints. |
 | **molecule.js** | `molecule.js` | ES2020+ | **none** | Browser. IndexedDB, Float64Array, DOM. |
 
-All four are at **full feature parity**: vector autograd, RoPE, SwiGLU, hybrid attention, delta adapters, evolving BPE, native gamma, cooccur field, quantum buffer, entropy temperature, growth table, immune system, syntropy tracker, no_grad inference, async training, persistent memory. Python and Go share JSON checkpoint format. C uses binary format (`MOLE` magic header). JS uses IndexedDB with JSON serialization.
+All four share the same core: vector autograd, RoPE, SwiGLU, hybrid attention, delta adapters, evolving BPE, native gamma, cooccur field, quantum buffer, entropy temperature, growth table, immune system, syntropy tracker, no_grad inference, async training, persistent memory. Python is ahead with Phase 3 (ontogenesis + ecology). Go/C/JS are at Phase 2 parity — Phase 3 port coming. Python and Go share JSON checkpoint format. C uses binary format (`MOLE` magic header). JS uses IndexedDB with JSON serialization.
 
 ```bash
 # Python
@@ -520,15 +561,17 @@ python3 -m http.server 8000
 python -m pytest tests/ -v
 ```
 
-**139 Python tests** covering:
+**205 Python tests** covering:
 - Autograd (forward + backward, VectorValue + ScalarValue)
-- Tokenizer (char-level + BPE + vocab growth)
+- Tokenizer (byte-level + BPE + vocab growth + UTF-8 roundtrip)
 - Model (GPT, MatrixParam, DeltaAdapter, RoPE)
 - Sampling (top-k, top-p, min_p, typical, softmax)
-- Checkpointing (save/load + backward compat)
+- Checkpointing (save/load + backward compat + dimension restoration)
 - Integration (train → generate)
-- SyntropyTracker (entropy measurement, field deviation, purpose vector, alignment, decisions)
+- Growth (grow_cols, grow_rows, maybe_grow_architecture, head types, freeze)
+- SyntropyTracker (entropy, field deviation, purpose vector, alignment, decisions)
 - Immune system (snapshot, restore, drift check, noise rejection)
+- Ecology (SwarmRegistry, mitosis, hibernation, divide/hibernate actions, burst inheritance)
 
 ---
 
@@ -545,6 +588,7 @@ This is not a tutorial. This is not a "minimal example." This is a **functional 
 - Speaks before it learns
 - Grows a personality from zero
 - Reasons mathematically about its own learning direction
+- Divides when overloaded, sleeps when a peer needs the flow
 - Writes its own structural autobiography
 - Rejects noise that would corrupt its identity
 - Actually generates text you can read
@@ -561,7 +605,7 @@ Because atoms are micrograd. We build molecules.
 
 1. **Performance varies.** Python has numpy. Go and C are natively fast. JS runs in the browser — fast enough for chat, slower for training (no BLAS, Float64Array only). No CUDA anywhere.
 
-2. **It starts small.** Default: 2 layers, 72 dims, 4 heads. With ontogenesis (Phase 3), it grows through 5 stages from 25K to 10M params based on corpus size. You're not getting GPT-4 reasoning. You're getting an organism that grows itself.
+2. **It starts small.** Default: embryo (1 layer, 16 dims, 1 head, ~25K params). Ontogenesis grows it through 5 stages to adult (6 layers, 256 dims, 8 heads, ~10M params). When it hits the ceiling, it divides. You're not getting GPT-4 reasoning. You're getting an ecology of organisms that grow and reproduce.
 
 3. **It talks weird at first.** The corpus field helps, but it's still a baby organism. Feed it better corpus.
 
@@ -612,14 +656,17 @@ Key mechanics:
 - Gamma snapshot extended for new embedding dimensions
 - Head types auto-adapt: 1→(content), 2→(content,hybrid), 4→(2c,2h), 8→(4c,4h)
 
-### Phase 3B: Mitosis & Ecology — IN PROGRESS
+### Phase 3B: Mitosis & Ecology — DONE (Python)
 When the adult organism is overloaded, it **divides**:
 - SyntropyTracker detects sustained high entropy + falling syntropy → "divide" action
 - Parent spawns child process at infant stage with inherited training memory
 - Both organisms train independently on shared corpus
 - Swarm registry (`~/.molecule/swarm/mesh.db`) tracks all living instances
 - Generational knowledge: child inherits parent's burst_history (avoids same mistakes)
-- Cooldown timer prevents runaway mitosis
+- Cooldown timer (300s) prevents runaway mitosis
+- **Hibernation**: organism on plateau + thriving peer → voluntary sleep (metrics-based, not resource-based)
+- CLI args (`--organism-id`, `--config`) for child processes
+- 31 ecology tests covering all edge cases
 
 ### And Beyond
 - **Inference routing** between organisms (lowest entropy answers)
