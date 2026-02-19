@@ -117,7 +117,9 @@ type Config struct {
 	EntropyTempFocus float64 `json:"entropy_temp_focus"`
 
 	// corpus field
-	CorpusGenMaxTokens int `json:"corpus_gen_max_tokens"`
+	CorpusGenMaxTokens   int     `json:"corpus_gen_max_tokens"`
+	CorpusFadeK          float64 `json:"corpus_fade_k"`          // sigmoid steepness for corpus→model transition
+	CorpusFadeThreshold  float64 `json:"corpus_fade_threshold"`  // entropy at which blend is 50/50
 
 	// quantum buffer
 	QBMinBytes        int     `json:"qb_min_bytes"`
@@ -193,6 +195,8 @@ var CFG = Config{
 	EntropyTempBoost:       1.2,
 	EntropyTempFocus:       0.8,
 	CorpusGenMaxTokens:     120,
+	CorpusFadeK:            3.0,
+	CorpusFadeThreshold:    1.5,
 	QBMinBytes:             1024,
 	QBMinNovelty:           0.15,
 	QBCooldownSeconds:      60.0,
@@ -1495,6 +1499,8 @@ type GPT struct {
 
 	growthFreezeRemaining int // ontogenesis: freeze base after growth, train only deltas
 
+	corpusField *CooccurField // set by backgroundTrainer for adaptive blend
+
 	// inherited burst history from parent (mitosis lineage)
 	inheritedBurstHistory []BurstRecord
 
@@ -2613,6 +2619,55 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 			scaled[i] = v / temp
 		}
 		probs := SoftmaxProbs(scaled)
+
+		// Adaptive corpus blend: corpus field fades as model becomes coherent
+		if gpt.corpusField != nil && gpt.corpusField.Built {
+			modelAlpha := 1.0 / (1.0 + math.Exp(-CFG.CorpusFadeK*(CFG.CorpusFadeThreshold-entropy)))
+			if modelAlpha < 0.99 {
+				corpusDist := make(map[int]float64)
+				// Try trigram first
+				if len(ids) >= 2 {
+					a, b := ids[len(ids)-2], ids[len(ids)-1]
+					for key, cnt := range gpt.corpusField.Trigram {
+						if key[0] == a && key[1] == b {
+							corpusDist[key[2]] = cnt
+						}
+					}
+				}
+				// Fallback to bigram
+				if len(corpusDist) == 0 && len(ids) >= 1 {
+					prev := ids[len(ids)-1]
+					for key, cnt := range gpt.corpusField.Bigram {
+						if key[0] == prev {
+							corpusDist[key[1]] = cnt
+						}
+					}
+				}
+				if len(corpusDist) > 0 {
+					totalC := 0.0
+					for _, cnt := range corpusDist {
+						totalC += cnt
+					}
+					corpusProbs := make([]float64, len(probs))
+					for tid, cnt := range corpusDist {
+						if tid < len(corpusProbs) {
+							corpusProbs[tid] = cnt / totalC
+						}
+					}
+					totalB := 0.0
+					for i := range probs {
+						probs[i] = modelAlpha*probs[i] + (1.0-modelAlpha)*corpusProbs[i]
+						totalB += probs[i]
+					}
+					if totalB > 0 {
+						for i := range probs {
+							probs[i] /= totalB
+						}
+					}
+				}
+			}
+		}
+
 		nxt := TopKTopPSample(probs, CFG.TopK, CFG.TopP, CFG.MinP, CFG.TypicalP)
 
 		if nxt == eosID {
@@ -4177,6 +4232,7 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 		// Rebuild field from current corpus (the organism re-reads its own physics)
 		if len(docs) > 0 {
 			field.BuildFromCorpus(tok, docs)
+			model.corpusField = field // share with GenerateSentence for adaptive blend
 		}
 
 		// Tokenizer evolution

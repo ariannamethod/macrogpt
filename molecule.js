@@ -107,6 +107,8 @@ const CFG = {
 
     // corpus generation
     corpusGenMaxTokens: 60,
+    corpusFadeK: 3.0,            // sigmoid steepness for corpus→model transition
+    corpusFadeThreshold: 1.5,    // entropy at which blend is 50/50
 
     // syntropy
     syntropyWindow: 20,
@@ -1562,6 +1564,9 @@ class GPT {
         // ontogenesis: freeze base after growth
         this._growthFreezeRemaining = 0;
 
+        // adaptive corpus blend: set by trainerTick
+        this._corpusField = null;
+
         // ensure at least one delta
         this.addDeltaModule(1.0);
     }
@@ -2267,7 +2272,46 @@ class GPT {
 
             const scaled = new Array(logits.data.length);
             for (let i = 0; i < logits.data.length; i++) scaled[i] = logits.data[i] / temp;
-            const probs = softmaxProbsFloat(scaled);
+            let probs = softmaxProbsFloat(scaled);
+
+            // Adaptive corpus blend: corpus field fades as model becomes coherent
+            if (this._corpusField && this._corpusField.bigram.size > 0) {
+                const modelAlpha = 1.0 / (1.0 + Math.exp(-CFG.corpusFadeK * (CFG.corpusFadeThreshold - entropy)));
+                if (modelAlpha < 0.99) {
+                    let corpusDist = null;
+                    // Try trigram first
+                    if (ids.length >= 2) {
+                        const tkey = ids[ids.length - 2] + "," + ids[ids.length - 1];
+                        if (this._corpusField.trigram.has(tkey)) {
+                            corpusDist = this._corpusField.trigram.get(tkey);
+                        }
+                    }
+                    // Fallback to bigram
+                    if (!corpusDist && ids.length >= 1) {
+                        const bkey = ids[ids.length - 1];
+                        if (this._corpusField.bigram.has(bkey)) {
+                            corpusDist = this._corpusField.bigram.get(bkey);
+                        }
+                    }
+                    if (corpusDist) {
+                        let totalC = 0;
+                        for (const cnt of corpusDist.values()) totalC += cnt;
+                        const corpusProbs = new Array(probs.length).fill(0);
+                        for (const [tid, cnt] of corpusDist.entries()) {
+                            if (tid < corpusProbs.length) corpusProbs[tid] = cnt / totalC;
+                        }
+                        let totalB = 0;
+                        for (let i = 0; i < probs.length; i++) {
+                            probs[i] = modelAlpha * probs[i] + (1.0 - modelAlpha) * corpusProbs[i];
+                            totalB += probs[i];
+                        }
+                        if (totalB > 0) {
+                            for (let i = 0; i < probs.length; i++) probs[i] /= totalB;
+                        }
+                    }
+                }
+            }
+
             const nxt = topKTopPSample(probs, CFG.topK, CFG.topP, CFG.minP, CFG.typicalP);
 
             if (nxt === eosId) {
@@ -2895,6 +2939,7 @@ async function trainerTick() {
         // Rebuild field
         if (docs.length > 0 && _field) {
             _field.buildFromCorpus(_tok, docs);
+            _model._corpusField = _field; // share with generateSentence for adaptive blend
         }
 
         // Tokenizer evolution

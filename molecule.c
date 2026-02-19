@@ -86,6 +86,8 @@ typedef struct {
 
     /* corpus field */
     int corpus_gen_max_tokens;
+    double corpus_fade_k;            /* sigmoid steepness for corpus->model transition */
+    double corpus_fade_threshold;    /* entropy at which blend is 50/50 */
 
     /* quantum buffer */
     int qb_min_bytes;
@@ -158,6 +160,8 @@ static Config CFG = {
     .entropy_low = 0.5, .entropy_high = 1.5,
     .entropy_temp_boost = 1.2, .entropy_temp_focus = 0.8,
     .corpus_gen_max_tokens = 120,
+    .corpus_fade_k = 3.0,
+    .corpus_fade_threshold = 1.5,
     .qb_min_bytes = 1024,
     .qb_min_novelty = 0.15,
     .qb_cooldown_seconds = 60.0,
@@ -1727,6 +1731,21 @@ static void adam_step(AdamState *st, MatrixParam *mat, double lr) {
         }
 }
 
+/* CooccurField struct (functions defined later, after tokenizer) */
+typedef struct { int key[3]; double count; } TrigramEntry;
+typedef struct { int key[2]; double count; } BigramEntry;
+#define COOCCUR_HASH_SIZE 16384
+
+typedef struct {
+    double *unigram;  /* [vocab_size] */
+    int vocab_size;
+    TrigramEntry *trigrams;
+    int n_trigrams, trigram_cap;
+    BigramEntry *bigrams;
+    int n_bigrams, bigram_cap;
+    int built;
+} CooccurField;
+
 /* The GPT model */
 #define MAX_BASE_MATS 256  /* adult: 6 layers × ~20 matrices + embedding matrices */
 #define MAX_DELTA_MODS 16
@@ -1760,6 +1779,9 @@ typedef struct {
 
     /* Phase 3A: ontogenesis — growth freeze counter */
     int growth_freeze_remaining;
+
+    /* Adaptive corpus blend: set by background_trainer */
+    CooccurField *corpus_field;
 
     pthread_mutex_t mu;
 } GPT;
@@ -2411,6 +2433,57 @@ static char *gpt_generate(GPT *g, const char *prompt) {
         for (int i = 0; i < V; i++) scaled[i] = logits->data[i] / temp;
         softmax_probs(scaled, V, probs_buf);
 
+        /* Adaptive corpus blend: corpus field fades as model becomes coherent */
+        if (g->corpus_field && g->corpus_field->built && g->corpus_field->n_bigrams > 0) {
+            double model_alpha = 1.0 / (1.0 + exp(-CFG.corpus_fade_k * (CFG.corpus_fade_threshold - entropy)));
+            if (model_alpha < 0.99) {
+                double *corpus_probs = calloc(V, sizeof(double));
+                double total_c = 0;
+                int found = 0;
+                /* Try trigram first */
+                if (ids.len >= 2) {
+                    int a = ids.items[ids.len - 2], b = ids.items[ids.len - 1];
+                    for (int ti = 0; ti < g->corpus_field->n_trigrams; ti++) {
+                        if (g->corpus_field->trigrams[ti].key[0] == a &&
+                            g->corpus_field->trigrams[ti].key[1] == b) {
+                            int tid = g->corpus_field->trigrams[ti].key[2];
+                            if (tid < V) {
+                                corpus_probs[tid] += g->corpus_field->trigrams[ti].count;
+                                total_c += g->corpus_field->trigrams[ti].count;
+                                found = 1;
+                            }
+                        }
+                    }
+                }
+                /* Fallback to bigram */
+                if (!found && ids.len >= 1) {
+                    int prev = ids.items[ids.len - 1];
+                    for (int bi = 0; bi < g->corpus_field->n_bigrams; bi++) {
+                        if (g->corpus_field->bigrams[bi].key[0] == prev) {
+                            int tid = g->corpus_field->bigrams[bi].key[1];
+                            if (tid < V) {
+                                corpus_probs[tid] += g->corpus_field->bigrams[bi].count;
+                                total_c += g->corpus_field->bigrams[bi].count;
+                                found = 1;
+                            }
+                        }
+                    }
+                }
+                if (found && total_c > 0) {
+                    double total_b = 0;
+                    for (int i = 0; i < V; i++) {
+                        corpus_probs[i] /= total_c;
+                        probs_buf[i] = model_alpha * probs_buf[i] + (1.0 - model_alpha) * corpus_probs[i];
+                        total_b += probs_buf[i];
+                    }
+                    if (total_b > 0) {
+                        for (int i = 0; i < V; i++) probs_buf[i] /= total_b;
+                    }
+                }
+                free(corpus_probs);
+            }
+        }
+
         int nxt = top_k_top_p_sample(probs_buf, V, CFG.top_k, CFG.top_p, CFG.min_p, CFG.typical_p);
         free(scaled);
 
@@ -2811,17 +2884,6 @@ static void qb_reset(QuantumBuffer *qb) {
  * ============================================================ */
 
 /* And lo, the corpus shall whisper its statistics, and words shall follow words. */
-#define COOCCUR_HASH_SIZE 16384
-
-typedef struct { int key[3]; double count; } TrigramEntry;
-
-typedef struct {
-    double *unigram;  /* [vocab_size] */
-    int vocab_size;
-    TrigramEntry *trigrams;
-    int n_trigrams, trigram_cap;
-    int built;
-} CooccurField;
 
 static CooccurField *cooccur_new(int vocab_size) {
     CooccurField *cf = calloc(1, sizeof(CooccurField));
@@ -2829,17 +2891,27 @@ static CooccurField *cooccur_new(int vocab_size) {
     cf->unigram = calloc(vocab_size, sizeof(double));
     cf->trigram_cap = 4096;
     cf->trigrams = calloc(cf->trigram_cap, sizeof(TrigramEntry));
+    cf->bigram_cap = 8192;
+    cf->bigrams = calloc(cf->bigram_cap, sizeof(BigramEntry));
     return cf;
 }
 
 static void cooccur_build(CooccurField *cf, EvolvingTokenizer *tok, StrArr *docs) {
     memset(cf->unigram, 0, sizeof(double) * cf->vocab_size);
     cf->n_trigrams = 0;
+    cf->n_bigrams = 0;
     for (int d = 0; d < docs->len; d++) {
         IntArr ids = tok_encode(tok, docs->items[d]);
         for (int i = 0; i < ids.len; i++) {
             if (ids.items[i] < cf->vocab_size)
                 cf->unigram[ids.items[i]] += 1.0;
+        }
+        /* Store bigrams */
+        for (int i = 0; i < ids.len - 1 && cf->n_bigrams < cf->bigram_cap; i++) {
+            cf->bigrams[cf->n_bigrams].key[0] = ids.items[i];
+            cf->bigrams[cf->n_bigrams].key[1] = ids.items[i+1];
+            cf->bigrams[cf->n_bigrams].count = 1.0;
+            cf->n_bigrams++;
         }
         /* Store trigrams (simplified: just keep last N) */
         for (int i = 0; i < ids.len - 2 && cf->n_trigrams < cf->trigram_cap; i++) {
@@ -3915,6 +3987,7 @@ static void *background_trainer(void *arg) {
         /* Rebuild field from current corpus (the organism re-reads its own physics) */
         if (docs.len > 0 && ctx->field) {
             cooccur_build(ctx->field, ctx->tok, &docs);
+            ctx->model->corpus_field = ctx->field; /* share with gpt_generate for adaptive blend */
         }
 
         /* Tokenizer evolution (char -> BPE enablement) + safe vocab expansion */

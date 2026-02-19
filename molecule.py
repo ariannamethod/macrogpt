@@ -131,6 +131,8 @@ class Config:
 
     # corpus field
     corpus_gen_max_tokens: int = 120
+    corpus_fade_k: float = 3.0           # sigmoid steepness for corpus→model transition
+    corpus_fade_threshold: float = 1.5   # entropy at which blend is 50/50
 
     # quantum buffer
     qb_min_bytes: int = 1024
@@ -1258,6 +1260,7 @@ class GPT:
         self.global_step = 0
         self.syntropy_temp_offset = 0.0  # temperature bridge from syntropy state
         self._growth_freeze_remaining = 0  # ontogenesis: freeze base after growth
+        self._corpus_field = None  # set by background_trainer for adaptive blend
 
         # Base weights
         V = tok.vocab_size
@@ -1922,6 +1925,32 @@ class GPT:
             temp = base_temp * t_mul
             scaled = (raw / temp).tolist()
             probs = softmax_probs_float(scaled)
+
+            # Adaptive corpus blend: corpus field fades as model becomes coherent
+            if self._corpus_field and self._corpus_field.bigram:
+                # sigmoid: low entropy → high model_alpha, high entropy → low model_alpha
+                model_alpha = 1.0 / (1.0 + math.exp(-CFG.corpus_fade_k * (CFG.corpus_fade_threshold - entropy)))
+                if model_alpha < 0.99:  # worth blending
+                    corpus_dist = {}
+                    if len(ids) >= 2:
+                        key = (ids[-2], ids[-1])
+                        if key in self._corpus_field.trigram:
+                            corpus_dist = dict(self._corpus_field.trigram[key])
+                    if not corpus_dist and len(ids) >= 1:
+                        if ids[-1] in self._corpus_field.bigram:
+                            corpus_dist = dict(self._corpus_field.bigram[ids[-1]])
+                    if corpus_dist:
+                        total_c = sum(corpus_dist.values())
+                        corpus_probs = [0.0] * len(probs)
+                        for tid, cnt in corpus_dist.items():
+                            if tid < len(corpus_probs):
+                                corpus_probs[tid] = cnt / total_c
+                        probs = [model_alpha * mp + (1.0 - model_alpha) * cp
+                                 for mp, cp in zip(probs, corpus_probs)]
+                        total_b = sum(probs)
+                        if total_b > 0:
+                            probs = [p / total_b for p in probs]
+
             nxt = top_k_top_p_sample(probs, CFG.top_k, CFG.top_p, CFG.min_p, CFG.typical_p)
 
             if nxt == self.tok.stoi[self.tok.EOS]:
@@ -2519,6 +2548,7 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer, swarm=None
         # Rebuild field from current corpus (the organism re-reads its own physics)
         if docs:
             field.build_from_corpus(tok, docs)
+            model._corpus_field = field  # share with generate_sentence for adaptive blend
 
         # Tokenizer evolution (char -> BPE enablement) + safe vocab expansion
         bpe_just_enabled = tok.maybe_enable_bpe(docs)
