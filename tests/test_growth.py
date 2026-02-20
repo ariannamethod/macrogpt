@@ -129,7 +129,11 @@ class TestMaybeGrowArchitecture(unittest.TestCase):
         self.assertEqual(self.model.current_growth_stage(), 1)
 
     def test_embryo_to_child(self):
-        """Should jump to child at 50KB+ corpus."""
+        """Should reach child via two sequential growths (one stage at a time)."""
+        grew = self.model.maybe_grow_architecture(60000)
+        self.assertTrue(grew)
+        self.assertEqual(self.model.current_growth_stage(), 1)  # infant first
+        self.model._growth_freeze_remaining = 0  # simulate freeze complete
         grew = self.model.maybe_grow_architecture(60000)
         self.assertTrue(grew)
         self.assertEqual(self.model.n_embd, 64)
@@ -162,8 +166,10 @@ class TestMaybeGrowArchitecture(unittest.TestCase):
         self.assertEqual(mod["l0.wq"].B.nin, 32)
 
     def test_new_layers_added(self):
-        """Growing to child should add layer 1."""
-        self.model.maybe_grow_architecture(60000)
+        """Growing to child should add layer 1 (two sequential growths)."""
+        self.model.maybe_grow_architecture(60000)  # 0→1 (infant)
+        self.model._growth_freeze_remaining = 0
+        self.model.maybe_grow_architecture(60000)  # 1→2 (child)
         self.assertIn("l1.wq", self.model.base)
         self.assertIn("l1.fc_g", self.model.base)
         # Delta should also have new layer
@@ -189,7 +195,9 @@ class TestMaybeGrowArchitecture(unittest.TestCase):
     def test_residual_alpha_updated(self):
         """residual_alpha should reflect new n_layer."""
         import math
-        self.model.maybe_grow_architecture(60000)  # child: 2 layers
+        self.model.maybe_grow_architecture(60000)  # 0→1 (infant)
+        self.model._growth_freeze_remaining = 0
+        self.model.maybe_grow_architecture(60000)  # 1→2 (child: 2 layers)
         expected = 1.0 / math.sqrt(2)
         self.assertAlmostEqual(self.model.residual_alpha, expected)
 

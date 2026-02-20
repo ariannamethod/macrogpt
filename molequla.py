@@ -1500,9 +1500,13 @@ class GPT:
         current = self.current_growth_stage()
         if current < 0:
             return False  # legacy checkpoint, skip growth
+        if self._growth_freeze_remaining > 0:
+            return False  # still stabilizing from last growth
         target = self.target_growth_stage(corpus_chars)
         if target <= current:
             return False
+        # Grow only one stage at a time — prevent catastrophic multi-stage jumps
+        target = current + 1
 
         _, new_embd, new_layer, new_head = CFG.growth_stages[target]
         old_embd = self.n_embd

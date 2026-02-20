@@ -2094,8 +2094,11 @@ static void adam_reset(AdamState *s, int new_nout, int new_nin) {
 static int gpt_maybe_grow_architecture(GPT *g, int corpus_chars) {
     int current = gpt_current_growth_stage(g);
     if (current < 0) return 0; /* legacy checkpoint, skip growth */
+    if (g->growth_freeze_remaining > 0) return 0; /* still stabilizing from last growth */
     int target = gpt_target_growth_stage(corpus_chars);
     if (target <= current) return 0;
+    /* Grow only one stage at a time — prevent catastrophic multi-stage jumps */
+    target = current + 1;
 
     int new_embd  = CFG.growth_stages[target][1];
     int new_layer = CFG.growth_stages[target][2];

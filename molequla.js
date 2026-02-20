@@ -1707,8 +1707,11 @@ class GPT {
     maybeGrowArchitecture(corpusChars) {
         const current = this.currentGrowthStage();
         if (current < 0) return false; // legacy checkpoint, skip growth
-        const target = this.targetGrowthStage(corpusChars);
+        if (this._growthFreezeRemaining > 0) return false; // still stabilizing from last growth
+        let target = this.targetGrowthStage(corpusChars);
         if (target <= current) return false;
+        // Grow only one stage at a time — prevent catastrophic multi-stage jumps
+        target = current + 1;
 
         const [, newEmbd, newLayer, newHead] = CFG.growthStages[target];
         const oldEmbd = this.nEmbd;

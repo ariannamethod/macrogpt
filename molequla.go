@@ -1977,10 +1977,15 @@ func (gpt *GPT) MaybeGrowArchitecture(corpusChars int) bool {
 	if current < 0 {
 		return false // legacy checkpoint, skip growth
 	}
+	if gpt.growthFreezeRemaining > 0 {
+		return false // still stabilizing from last growth
+	}
 	target := gpt.TargetGrowthStage(corpusChars)
 	if target <= current {
 		return false
 	}
+	// Grow only one stage at a time — prevent catastrophic multi-stage jumps
+	target = current + 1
 
 	newEmbd := CFG.GrowthStages[target][1]
 	newLayer := CFG.GrowthStages[target][2]
