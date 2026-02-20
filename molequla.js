@@ -52,7 +52,8 @@ const CFG = {
         [200000, 128, 4, 4],   // adolescent: ~2M params
         [500000, 256, 6, 8],   // adult: ~10M params
     ],
-    freezeAfterGrowthSteps: 200,
+    freezeAfterGrowthSteps: 500,
+    postGrowthLRScale: 0.3,          // LR multiplier during freeze period
 
     // training
     warmupSteps: 1200,
@@ -2189,10 +2190,10 @@ class GPT {
             keys[li].push(k);
             values[li].push(v);
 
-            // Sliding window: keep only last blockSize entries in KV cache
+            // Sliding window: shift instead of slice to avoid GC pressure
             if (keys[li].length > this.blockSize) {
-                keys[li] = keys[li].slice(-this.blockSize);
-                values[li] = values[li].slice(-this.blockSize);
+                keys[li].splice(0, keys[li].length - this.blockSize);
+                values[li].splice(0, values[li].length - this.blockSize);
             }
 
             const headOutputs = [];
@@ -2795,7 +2796,9 @@ function trainSteps(model, tok, docs, steps, trainBase, trainDeltas) {
             else accumLoss += loss.data;
         }
 
-        const lr = cosineLR(model.globalStep);
+        let lr = cosineLR(model.globalStep);
+        // Post-growth LR dampening: reduce LR during freeze to prevent delta overfit to noise
+        if (model._growthFreezeRemaining > 0) lr *= CFG.postGrowthLRScale;
         if (baseParams.length) model.adamStep(baseParams, "base", lr);
         if (deltaParams.length) model.adamStep(deltaParams, "delta", lr);
         model.globalStep++;

@@ -64,7 +64,8 @@ class Config:
         (200000, 128, 4, 4),     # adolescent: ~2M params
         (500000, 256, 6, 8),     # adult: ~10M params
     )
-    freeze_after_growth_steps: int = 200  # freeze base weights after growth, train only deltas
+    freeze_after_growth_steps: int = 500  # freeze base weights after growth, train only deltas
+    post_growth_lr_scale: float = 0.3    # LR multiplier during freeze period (prevents delta overfit to noise)
 
     # training
     warmup_steps: int = 1200
@@ -542,14 +543,14 @@ def _generate_resonant_impl(model, tok, field, prompt_text, model_alpha):
             model_probs = softmax_probs_float(scaled)
 
         # corpus bias
-        corpus_dist = {}
+        corpus_dist = None
         if len(ids) >= 2:
             key = (ids[-2], ids[-1])
             if key in field.trigram:
-                corpus_dist = dict(field.trigram[key])
-        if not corpus_dist and len(ids) >= 1:
+                corpus_dist = field.trigram[key]  # read-only, no copy needed
+        if corpus_dist is None and len(ids) >= 1:
             if ids[-1] in field.bigram:
-                corpus_dist = dict(field.bigram[ids[-1]])
+                corpus_dist = field.bigram[ids[-1]]
 
         if corpus_dist:
             total_c = sum(corpus_dist.values())
@@ -2111,14 +2112,14 @@ class GPT:
                 # sigmoid: low entropy -> high model_alpha, high entropy -> low model_alpha
                 model_alpha = 1.0 / (1.0 + math.exp(-CFG.corpus_fade_k * (CFG.corpus_fade_threshold - entropy)))
                 if model_alpha < 0.99:  # worth blending
-                    corpus_dist = {}
+                    corpus_dist = None
                     if len(ids) >= 2:
                         key = (ids[-2], ids[-1])
                         if key in self._corpus_field.trigram:
-                            corpus_dist = dict(self._corpus_field.trigram[key])
-                    if not corpus_dist and len(ids) >= 1:
+                            corpus_dist = self._corpus_field.trigram[key]  # read-only, no copy needed
+                    if corpus_dist is None and len(ids) >= 1:
                         if ids[-1] in self._corpus_field.bigram:
-                            corpus_dist = dict(self._corpus_field.bigram[ids[-1]])
+                            corpus_dist = self._corpus_field.bigram[ids[-1]]
                     if corpus_dist:
                         total_c = sum(corpus_dist.values())
                         corpus_probs = [0.0] * len(probs)
@@ -2628,6 +2629,9 @@ def _train_steps_locked(model, tok, docs, steps, train_base, train_deltas):
             backward(loss)
 
         lr = cosine_lr(model.global_step)
+        # Post-growth LR dampening: reduce LR during freeze to prevent delta overfit to noise
+        if model._growth_freeze_remaining > 0:
+            lr *= CFG.post_growth_lr_scale
         model.global_step += 1
 
         if base_params:

@@ -65,7 +65,7 @@ function saveCheckpoint(model, tok) {
             min_new_chars_to_train: CFG.minNewCharsToTrain || 480,
             tie_embeddings: CFG.tieEmbeddings, n_layer: CFG.nLayer, n_embd: CFG.nEmbd,
             n_head: CFG.nHead, block_size: CFG.blockSize,
-            growth_stages: CFG.growthStages, freeze_after_growth_steps: CFG.freezeAfterGrowthSteps,
+            growth_stages: CFG.growthStages, freeze_after_growth_steps: CFG.freezeAfterGrowthSteps, post_growth_lr_scale: CFG.postGrowthLRScale,
             warmup_steps: CFG.warmupSteps, micro_steps: CFG.microSteps,
             accum_steps: CFG.accumSteps, batch_size: CFG.batchSize || 1,
             learning_rate: CFG.lr, lr_min: CFG.lrMin, cosine_warmup_steps: CFG.cosineWarmupSteps,

@@ -30,7 +30,7 @@ struct Config {
     max_corpus_lines: usize, max_line_chars: usize, min_new_chars_to_train: usize,
     tie_embeddings: bool,
     n_layer: usize, n_embd: usize, n_head: usize, block_size: usize,
-    growth_stages: Vec<[usize; 4]>, freeze_after_growth_steps: usize,
+    growth_stages: Vec<[usize; 4]>, freeze_after_growth_steps: usize, post_growth_lr_scale: f64,
     warmup_steps: usize, micro_steps: usize,
     learning_rate: f64, beta1: f64, beta2: f64, eps_adam: f64, grad_clip: f64,
     freeze_base_after_warmup: bool, batch_size: usize,
@@ -91,7 +91,8 @@ impl Default for Config {
             max_corpus_lines: 8000, max_line_chars: 240, min_new_chars_to_train: 480,
             tie_embeddings: true, n_layer: 1, n_embd: 16, n_head: 1, block_size: 96,
             growth_stages: vec![[0,16,1,1],[20000,32,1,2],[50000,64,2,4],[200000,128,4,4],[500000,256,6,8]],
-            freeze_after_growth_steps: 200, warmup_steps: 1200, micro_steps: 32,
+            freeze_after_growth_steps: 500, post_growth_lr_scale: 0.3,
+            warmup_steps: 1200, micro_steps: 32,
             learning_rate: 0.01, beta1: 0.9, beta2: 0.99, eps_adam: 1e-8, grad_clip: 1.0,
             freeze_base_after_warmup: true, batch_size: 4,
             lr_min: 0.001, max_total_steps: 50000, cosine_warmup_steps: 200, accum_steps: 1,
@@ -1769,7 +1770,9 @@ fn train_steps(model: &mut GPT, docs: &[String], steps: usize, train_base: bool,
             batch_loss = seq_loss_sum / cfg.batch_size as f64;
         }
 
-        let lr = cosine_lr(model.global_step, &cfg);
+        let mut lr = cosine_lr(model.global_step, &cfg);
+        // Post-growth LR dampening: reduce LR during freeze to prevent delta overfit to noise
+        if model.growth_freeze_remaining > 0 { lr *= cfg.post_growth_lr_scale; }
         model.global_step += 1;
 
         // Adam step for base parameters

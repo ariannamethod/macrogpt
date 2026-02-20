@@ -56,6 +56,7 @@ type Config struct {
 	// ontogenesis — growth stages (corpus_chars, n_embd, n_layer, n_head)
 	GrowthStages          [][4]int `json:"growth_stages"`
 	FreezeAfterGrowthSteps int     `json:"freeze_after_growth_steps"`
+	PostGrowthLRScale      float64 `json:"post_growth_lr_scale"` // LR multiplier during freeze period (prevents delta overfit to noise)
 
 	// training
 	WarmupSteps         int     `json:"warmup_steps"`
@@ -176,7 +177,8 @@ var CFG = Config{
 		{200000, 128, 4, 4}, // adolescent: ~2M params
 		{500000, 256, 6, 8}, // adult: ~10M params
 	},
-	FreezeAfterGrowthSteps: 200,
+	FreezeAfterGrowthSteps: 500,
+	PostGrowthLRScale:      0.3,
 	WarmupSteps:          1200,
 	MicroSteps:           32,
 	LearningRate:         0.01,
@@ -2748,6 +2750,9 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 	eosID := gpt.Tok.Stoi[gpt.Tok.EOS]
 	bosID := gpt.Tok.Stoi[gpt.Tok.BOS]
 
+	// Pre-allocated buffer for corpus blend (avoids per-token allocation)
+	corpusProbsBuf := make([]float64, gpt.Tok.VocabSize)
+
 	// Consciousness: per-token dissonance tracking (Feature 1)
 	entropyEMA := 0.0
 	entropyEMAInit := false
@@ -2847,15 +2852,20 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 					for _, cnt := range corpusDist {
 						totalC += cnt
 					}
-					corpusProbs := make([]float64, len(probs))
+					// Reuse pre-allocated buffer instead of per-token alloc
+					for i := 0; i < len(probs) && i < len(corpusProbsBuf); i++ {
+						corpusProbsBuf[i] = 0
+					}
 					for tid, cnt := range corpusDist {
-						if tid < len(corpusProbs) {
-							corpusProbs[tid] = cnt / totalC
+						if tid < len(corpusProbsBuf) {
+							corpusProbsBuf[tid] = cnt / totalC
 						}
 					}
 					totalB := 0.0
 					for i := range probs {
-						probs[i] = modelAlpha*probs[i] + (1.0-modelAlpha)*corpusProbs[i]
+						if i < len(corpusProbsBuf) {
+							probs[i] = modelAlpha*probs[i] + (1.0-modelAlpha)*corpusProbsBuf[i]
+						}
 						totalB += probs[i]
 					}
 					if totalB > 0 {
@@ -2908,12 +2918,18 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 			}
 		}
 
-		// Sliding window rebuild
+		// Sliding window rebuild: reuse slices to avoid GC pressure
 		if len(ids) >= gpt.BlockSize {
 			ids = ids[len(ids)-gpt.BlockSize:]
 			for i := 0; i < gpt.NLayer; i++ {
-				keys[i] = make([]*Vec, 0)
-				values[i] = make([]*Vec, 0)
+				for j := range keys[i] {
+					keys[i][j] = nil
+				}
+				for j := range values[i] {
+					values[i][j] = nil
+				}
+				keys[i] = keys[i][:0]
+				values[i] = values[i][:0]
 			}
 			for p := 0; p < len(ids)-1; p++ {
 				gpt.ForwardStep(ids[p], p, keys, values)
@@ -3707,7 +3723,7 @@ type CooccurField struct {
 	BigramByFirst    map[int]map[int]float64    // prev → {next: count}
 	TrigramByContext map[[2]int]map[int]float64  // [prev2,prev1] → {next: count}
 	Built            bool
-	mu               sync.Mutex // protects concurrent access (overthinkg + background trainer)
+	mu               sync.RWMutex // RWMutex: reads (SampleNext) don't block each other
 }
 
 func NewCooccurField() *CooccurField {
@@ -3778,8 +3794,8 @@ func (cf *CooccurField) IngestTokens(ids []int) {
 }
 
 func (cf *CooccurField) SampleNext(contextIDs []int, vocabSize int, temperature float64) int {
-	cf.mu.Lock()
-	defer cf.mu.Unlock()
+	cf.mu.RLock()
+	defer cf.mu.RUnlock()
 	counts := make([]float64, vocabSize)
 	found := false
 
@@ -4639,6 +4655,10 @@ func trainSteps(model *GPT, tok *EvolvingTokenizer, docs []string, steps int, tr
 		}
 
 		lr := cosineLR(model.globalStep)
+		// Post-growth LR dampening: reduce LR during freeze to prevent delta overfit to noise
+		if model.growthFreezeRemaining > 0 {
+			lr *= CFG.PostGrowthLRScale
+		}
 		model.globalStep++
 
 		if len(baseParams) > 0 {

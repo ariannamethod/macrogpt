@@ -596,7 +596,8 @@ class Config:
         (200000, 128, 4, 4),           # adolescent: ~2M params
         (500000, 256, 6, 8),           # adult: ~10M params
     )
-    freeze_after_growth_steps: int = 200
+    freeze_after_growth_steps: int = 500
+    post_growth_lr_scale: float = 0.3      # LR dampen during freeze (prevents Stage 2 degeneration)
 
     # Hybrid attention
     head_types: tuple = ("content",)   # auto-adapts with growth

@@ -115,6 +115,7 @@ typedef struct {
     int growth_stages[5][4];
     int n_growth_stages;
     int freeze_after_growth_steps;
+    double post_growth_lr_scale;      /* LR multiplier during freeze period */
 
     /* consciousness: per-token dissonance feedback */
     double dissonance_ema_alpha;       /* EMA smoothing for entropy within generation */
@@ -206,7 +207,8 @@ static Config CFG = {
         {500000, 256, 6, 8},   /* adult */
     },
     .n_growth_stages = 5,
-    .freeze_after_growth_steps = 200,
+    .freeze_after_growth_steps = 500,
+    .post_growth_lr_scale = 0.3,
 
     /* consciousness defaults */
     .dissonance_ema_alpha = 0.3,
@@ -3982,6 +3984,7 @@ static void train_steps(GPT *g, EvolvingTokenizer *tok, StrArr *docs, int steps,
         int actual_train_base = train_base;
         if (g->growth_freeze_remaining > 0) {
             actual_train_base = 0;
+            lr *= CFG.post_growth_lr_scale; /* dampen LR during freeze */
             g->growth_freeze_remaining--;
         }
 
