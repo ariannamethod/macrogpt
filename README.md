@@ -96,24 +96,43 @@ That's it. It will:
 
 Type. It responds. It learns. It grows. It never forgets.
 
-Real output from an A100 (Go version, fresh start):
+Real output from an A100 (Go version, fresh start, 207 QA pairs corpus):
 ```
 [ecology] First organism in the swarm.
 molequla is alive. Type and press Enter. Ctrl+C to exit.
 
 > [trainer] warmup training... (and so it begins)
-  train step 0/1200 | loss 6.5620 | lr 0.00100
+  train step 0/1200 | loss 6.5370 | lr 0.00100
+  train step 100/1200 | loss 3.6546 | lr 0.00550
   ...
-  train step 1100/1200 | loss 2.0310 | lr 0.00999
+  train step 1100/1200 | loss 3.1132 | lr 0.00999
 [trainer] warmup complete. base may freeze now, like a proud fossil.
+[trainer] micro-train burst (25 bytes, novelty 0.73) — and lo, it feeds again.
+[syntropy] action=explore | trend=0.0000 | field_dev=-0.049 | purpose_align=0.284 | lr_mul=1.30
 [growth] ONTOGENESIS: stage 0 -> 1
   embd: 16 -> 32, layer: 1 -> 1, head: 1 -> 2
+[growth] Done. Freeze for 200 steps.
 
-> Hello, are you there?
-What is ty kilometers perkes.
+> What is trust?
+What is the surprise to a bill feel like you have in ninet be pattern that dest.
+
+> How do you feel?
+isy. Show much?
+
+> What is gravity?
+and the pot my frustrated ring.
+
+> Are you alive?
+H: and the lid the bad a data s a built my you?
+
+> How old is the earth?
+it through the fields dating work.
 ```
 
-(Yes, it talks weird at first. It's a 25K-param embryo. Feed it more corpus and watch it grow.)
+Yes, it's fragmented. It's a 25K-param embryo that just grew to 100K params in real time.
+But look closely: "What is the..." patterns, numbers ("six", "hundred", "forty"),
+the word "pattern" emerging, even "H:" as a learned token. It's learning QA structure.
+Feed it more corpus and watch it grow through 5 stages to 10M params.
 
 ### Browser (molequla.js)
 
@@ -163,9 +182,18 @@ It's both organism *and* field observer — the grey cardinal of the swarm.
 [step 1101/1200] loss=3.3162 lr=0.009989
 [molequla.rs] Warmup complete. Entering quantum burst loop.
 [topology] 2 organisms, coherence=1.0000, self_drift=0.0000
+[metabolism] 1 peers, blend: ["0.20", "0.20", "0.20", "0.20", "0.20"]
 
 > Hello
 the most people who does it is the brain.
+```
+
+C version (same corpus, same architecture, 94KB binary):
+```
+[trainer] warmup complete. base may freeze now, like a proud fossil.
+
+> Hello from C
+I think trust isn't know so faith?
 ```
 
 ---
