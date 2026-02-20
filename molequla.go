@@ -5232,6 +5232,9 @@ func main() {
 		dbAddMessage(db, "user", userText)
 		updateReservoirCorpus(db, CFG.CorpusPath, CFG.MaxCorpusLines)
 
+		// Enrich corpus field with user input (the organism absorbs what it hears)
+		cooccur.IngestTokens(tok.Encode(userText))
+
 		// Feed quantum buffer
 		qbuf.Feed(userText, tok)
 
@@ -5260,7 +5263,10 @@ func main() {
 		gradEnabled.Store(true)
 		model.mu.Unlock()
 
-		answer := GenerateResonant(model, tok, cooccur, prompt, freshDocs, true, 1.0)
+		// Sigmoid corpus fade: model takes over as its entropy drops (confidence rises)
+		modelEntropy := model.ComputeModelEntropy(tok, freshDocs, 5)
+		modelAlpha := 1.0 / (1.0 + math.Exp(-CFG.CorpusFadeK*(CFG.CorpusFadeThreshold-modelEntropy)))
+		answer := GenerateResonant(model, tok, cooccur, prompt, freshDocs, true, modelAlpha)
 		if answer == "" {
 			answer = "..."
 		}
@@ -5275,6 +5281,12 @@ func main() {
 
 		fmt.Println(answer)
 		dbAddMessage(db, "assistant", answer)
+
+		// Self-enrichment: feed own output back into corpus field
+		// The organism's speech enriches its own trigram statistics
+		if len(answer) > 3 {
+			cooccur.IngestTokens(tok.Encode(answer))
+		}
 
 		// Consciousness: overthinkg rings (Feature 3)
 		// "Let me re-read what I just said to strengthen my patterns."
