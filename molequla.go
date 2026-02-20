@@ -5111,6 +5111,20 @@ func main() {
 			corpusChars += len(d)
 		}
 		stageNames := []string{"embryo", "infant", "child", "adolescent", "teen", "adult"}
+
+		// Build temp cooccur field for stage demos
+		tmpCooccur := NewCooccurField()
+		tmpCooccur.BuildFromCorpus(tok, docs)
+
+		// Detect if stdin is a terminal (interactive mode)
+		isInteractive := false
+		if fi, err := os.Stdin.Stat(); err == nil {
+			isInteractive = (fi.Mode() & os.ModeCharDevice) != 0
+		}
+
+		stageProbes := []string{"Hello.", "Who are you?", "What do you know?"}
+		initScanner := bufio.NewScanner(os.Stdin)
+
 		for {
 			stage := model.CurrentGrowthStage()
 			stageName := "unknown"
@@ -5123,11 +5137,43 @@ func main() {
 			trainSteps(model, tok, docs, CFG.WarmupSteps, true, true)
 			model.lastWarmupStage = stage
 			SaveCheckpoint(model, tok, "")
+
+			// Demo: show what the organism can say at this stage
+			fmt.Printf("\n[stage %d — %s] What it sounds like now:\n", stage, stageName)
+			for _, probe := range stageProbes {
+				answer := GenerateResonant(model, tok, tmpCooccur, probe, docs, false, 1.0)
+				if answer == "" {
+					answer = "..."
+				}
+				fmt.Printf("  Q: %s\n  A: %s\n", probe, answer)
+			}
+			fmt.Println()
+
 			// Try to grow to next stage (gated by corpus size)
 			if !model.MaybeGrowArchitecture(corpusChars) {
 				break // corpus too small for next stage, or already at max
 			}
 			model.growthFreezeRemaining = 0 // skip freeze during init — we're about to warmup anyway
+
+			// Interactive mode: pause between stages, let user chat or type /grow
+			if isInteractive {
+				fmt.Printf("[init] Stage %d complete. Chat with the organism, or type /grow to continue growth.\n", stage)
+				for {
+					fmt.Print("> ")
+					if !initScanner.Scan() {
+						break
+					}
+					line := strings.TrimSpace(initScanner.Text())
+					if line == "/grow" || line == "" {
+						break
+					}
+					answer := GenerateResonant(model, tok, tmpCooccur, line, docs, true, 1.0)
+					if answer == "" {
+						answer = "..."
+					}
+					fmt.Println(answer)
+				}
+			}
 		}
 		fmt.Printf("[init] Warmup complete at stage %d. Organism ready.\n", model.CurrentGrowthStage())
 	}
