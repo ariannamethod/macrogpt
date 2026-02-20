@@ -560,7 +560,9 @@ def _generate_resonant_impl(model, tok, field, prompt_text, model_alpha):
             for tid, cnt in corpus_dist.items():
                 if tid < len(corpus_probs):
                     corpus_probs[tid] = cnt / total_c
-            blended = [model_alpha * mp + (1.0 - model_alpha) * cp
+            # Adaptive blend: model takes over as it becomes confident
+            adaptive_model_w = 1.0 / (1.0 + math.exp(-CFG.corpus_fade_k * (CFG.corpus_fade_threshold - entropy)))
+            blended = [adaptive_model_w * mp + (1.0 - adaptive_model_w) * cp
                        for mp, cp in zip(model_probs, corpus_probs)]
             total_b = sum(blended)
             if total_b > 0:
