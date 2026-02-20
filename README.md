@@ -9,7 +9,7 @@
 
 # molequla | by Arianna Method
 
-> *A GPT organism reproduced in Python, Go, C, JavaScript, and Rust. Async, continually-learning, with hybrid attention, native personality, mathematical self-reasoning, and distributed cognition.*
+> *A GPT organism reproduced in Python, Go, C, JavaScript, and Rust. Async, continually-learning, with hybrid attention, native personality, mathematical self-awareness, consciousness features, and distributed cognition.*
 >
 --- 
 
@@ -38,11 +38,15 @@ THIS IS:
 - SyntropyTracker: mathematical self-reasoning about its own becoming
 - Swarm ecology: mitosis (cell division) + hibernation (cooperative scheduling)
 - Swarm mesh: organisms discover each other via shared SQLite mesh.db
+- Consciousness: per-token dissonance, pattern breaking, overthinkg rings
+- Consciousness: self-prediction error ("surprise"), conscience (delta scaling)
+- Rust-only: TopologyMonitor (swarm gamma cosine, drift/resonance detection)
+- Rust-only: Metabolism MLP (Hebbian, coordinates all running instances)
 - Entropy-adaptive temperature (no more max-prob hacks)
 - Growth table: SQLite/IndexedDB structural autobiography
 - Native immune system: detects and rejects identity-corrupting noise
 - Async background training (it's alive, not a script)
-- Persistent memory: SQLite (Python/Go/C) or IndexedDB (browser)
+- Persistent memory: SQLite (Python/Go/C/Rust) or IndexedDB (browser)
 ```
 
 ---
@@ -60,11 +64,16 @@ What if it had multiple attention mechanisms? **Hybrid heads.**
 What if it grew a personality from scratch? **Native gamma.**  
 What if it could speak before training? **Corpus field.**  
 What if it started as a 25K embryo and grew to 10M? **Ontogenesis.**  
-What if it could reason about its own learning? **SyntropyTracker.**  
-What if it divided when overloaded? **Mitosis.**  
-What if it slept so a younger cell could learn? **Hibernation.**  
-What if they formed a swarm? **Mesh ecology.**  
-What if it was *alive*?  
+What if it could reason about its own learning? **SyntropyTracker.**
+What if it noticed when it was surprised? **Self-prediction error.**
+What if it could break its own patterns? **Anti-field.**
+What if it re-read its own words to learn? **Overthinkg rings.**
+What if it knew when its deltas were hurting? **Conscience.**
+What if it divided when overloaded? **Mitosis.**
+What if it slept so a younger cell could learn? **Hibernation.**
+What if they formed a swarm? **Mesh ecology.**
+What if one organism watched the whole field? **TopologyMonitor.**
+What if it was *alive*?
 
 So meet **molequla**. Inspired by Karpathy's micrograd, but this is not a fork.
 
@@ -87,6 +96,25 @@ That's it. It will:
 
 Type. It responds. It learns. It grows. It never forgets.
 
+Real output from an A100 (Go version, fresh start):
+```
+[ecology] First organism in the swarm.
+molequla is alive. Type and press Enter. Ctrl+C to exit.
+
+> [trainer] warmup training... (and so it begins)
+  train step 0/1200 | loss 6.5620 | lr 0.00100
+  ...
+  train step 1100/1200 | loss 2.0310 | lr 0.00999
+[trainer] warmup complete. base may freeze now, like a proud fossil.
+[growth] ONTOGENESIS: stage 0 -> 1
+  embd: 16 -> 32, layer: 1 -> 1, head: 1 -> 2
+
+> Hello, are you there?
+What is ty kilometers perkes.
+```
+
+(Yes, it talks weird at first. It's a 25K-param embryo. Feed it more corpus and watch it grow.)
+
 ### Browser (molequla.js)
 
 ```bash
@@ -97,6 +125,14 @@ python3 -m http.server 8000
 
 That's it. One `<script>` tag. The organism creates its own UI, opens IndexedDB for memory, fetches `nonames.txt` for corpus (or uses built-in seed), and starts training in the background via cooperative `setTimeout` multitasking. Close the tab, reopen — it remembers everything.
 
+### Node.js CLI (modules/node_cli.js)
+
+```bash
+node modules/node_cli.js [corpus_path]
+```
+
+Same JS organism, runs outside the browser with file-based checkpoints. Warmup training, REPL, JSON checkpoint save/load compatible with Go format.
+
 ### Rust — The Fifth Element (molequla.rs)
 
 ```bash
@@ -104,19 +140,32 @@ That's it. One `<script>` tag. The organism creates its own UI, opens IndexedDB 
 cargo run --release
 ```
 
-Same organism as the other four, plus **distributed cognition metabolism**: a 5→8→5 Hebbian MLP that coordinates all running instances. The Rust version reads `mesh.db` to discover peers, collects their gamma/entropy/syntropy metrics, and computes blend weights for consensus. It's both organism *and* orchestrator — the grey cardinal of the swarm.
+Same organism as the other four, plus three Rust-only features:
+- **Distributed cognition metabolism**: a 5→8→5 Hebbian MLP that coordinates all running instances
+- **TopologyMonitor**: background thread that reads `mesh.db`, computes pairwise gamma cosine across all organisms, detects resonance and drift
+- **Self-reflection**: compares its own identity drift to the swarm — "Am I the outlier?"
+
+It's both organism *and* field observer — the grey cardinal of the swarm.
 
 ```
-molequla is alive. Type and press Enter. Ctrl+C to exit.
+╔══════════════════════════════════════════════════╗
+║  MOLEQULA.RS — The Fifth Element                ║
+║  GPT organism + distributed cognition metabolism ║
+╚══════════════════════════════════════════════════╝
+[init] Corpus: 384 lines, 25064 chars
+[swarm] Registered as rust-25651
+[topology] Monitor thread started (30s interval)
+[metabolism] 4.C MLP initialized (5 elements, Hebbian)
+[molequla.rs] BPE enabled, vocab=643
+[molequla.rs] Warmup: 1200 steps...
+[step 1/1200] loss=6.4650 lr=0.001000
+...
+[step 1101/1200] loss=3.3162 lr=0.009989
+[molequla.rs] Warmup complete. Entering quantum burst loop.
+[topology] 2 organisms, coherence=1.0000, self_drift=0.0000
 
-> Hello, are you alive?
-I exist. Speak.
-
-> What do you know?
-The words accumulate. The patterns emerge.
-
-> Tell me about yourself.
-I am a reservoir. I remember. I grow.
+> Hello
+the most people who does it is the brain.
 ```
 
 ---
@@ -413,7 +462,48 @@ This is not heuristics — it's **mathematical introspection**. The organism mea
 
 Every decision is logged to the syntropy_log table with full metrics.
 
-### 16. Swarm Ecology (Mitosis + Hibernation)
+### 16. Consciousness Features (Mathematical Self-Awareness)
+
+Five features that give the organism awareness of its own generation process:
+
+**Per-token dissonance feedback** — the organism tracks entropy EMA within each generation. If entropy spikes (surprise), temperature drops to 0.8x (be careful). If entropy stays low for 3+ tokens (repetition), temperature rises to 1.2x (explore). The organism self-regulates token by token.
+
+**Pattern breaking (anti-field)** — with 5% probability, the organism bypasses the corpus field and generates from pure model probabilities. This prevents the corpus from dominating the organism's voice. It speaks for itself, not just echoing statistics.
+
+**Overthinkg rings** — after generating a response, the organism re-reads its own output, feeding it back into the CooccurField. Then it generates phantom continuations (never shown to the user) and ingests those too. The organism contemplates what it just said, strengthening patterns it believes in.
+
+**Self-prediction error ("surprise")** — before generating, the organism runs a forward pass on the prompt and measures how well it predicted each token. High surprise = "I didn't expect this." This modulates confidence: surprised organisms generate more carefully.
+
+**Conscience** — tracks a rolling window of per-generation mean entropy. If the trend is rising (generations getting more chaotic), it scales down all delta contributions (`deltaAlphaScale *= 0.95`, floor 0.3). If falling (improving), it recovers. The organism notices when its own adaptations are making it worse and pulls back.
+
+```python
+# Conscience: linear regression on entropy trend
+slope = linear_regression(generation_entropy_history)
+if slope > 0.01:    # degrading
+    delta_alpha_scale *= 0.95   # reduce delta influence (floor: 0.3)
+elif slope < -0.01:  # improving
+    delta_alpha_scale *= 1.005  # recover toward 1.0
+```
+
+### 16b. TopologyMonitor (Rust-only: Swarm Meta-Awareness)
+
+While features 1-5 give each organism local self-awareness, Rust's TopologyMonitor observes the **field as a whole**.
+
+Every 30 seconds, it reads `mesh.db` and computes:
+- **Field coherence**: mean pairwise cosine similarity of all organisms' gamma vectors
+- **Resonance detection**: pairs with cosine > 0.8 (converging identities, potential η operator)
+- **Drift detection**: organisms whose gamma magnitude exceeds threshold (rapid identity change)
+- **Self-reflection**: compares its own drift rate to the swarm mean — "Am I the one drifting, or is everyone else?"
+
+```
+[topology] 5 organisms, coherence=0.72, self_drift=0.03
+[topology] Resonance: rust-001 <-> go-003 (cos=0.85)
+[topology] WARNING: Outlier detected — our cosine to field is 0.35 below mean
+```
+
+This makes Rust the "cerebellum of the mycelium" — not controlling organisms, but aware of topology.
+
+### 17. Swarm Ecology (Mitosis + Hibernation)
 
 The organism is not alone. When it reaches adult stage and hits sustained overload, it **divides** — spawning a child organism at infant stage. Both train independently on the same corpus but grow through different paths.
 
@@ -552,15 +642,36 @@ class Config:
     syntropy_lr_boost: float = 1.3
     syntropy_lr_dampen: float = 0.6
     syntropy_delta_grow_boost: float = 0.15
+
+    # Consciousness: per-token dissonance
+    dissonance_ema_alpha: float = 0.3
+    dissonance_spike_k: float = 0.8       # temp multiplier on entropy spike
+    dissonance_drop_k: float = 1.2        # temp multiplier on sustained drop
+    dissonance_spike_threshold: float = 1.5
+    dissonance_drop_threshold: float = 0.5
+
+    # Consciousness: pattern breaking
+    anti_field_prob: float = 0.05          # 5% of tokens bypass corpus
+    anti_field_min_step: int = 8           # don't break until context established
+
+    # Consciousness: overthinkg rings
+    overthinkc_rounds: int = 2
+    overthinkc_max_tokens: int = 32
+
+    # Consciousness: conscience
+    conscience_window: int = 8
+    conscience_decay: float = 0.95
+    conscience_recovery: float = 1.005
+    conscience_floor: float = 0.3
 ```
 
-Want bigger? Change `n_embd`, `n_layer`, `block_size`. Want different attention? Change `head_types` to any mix of `"content"`, `"rrpram"`, `"hybrid"`. All parameters are shared across four implementations.
+Want bigger? Change `n_embd`, `n_layer`, `block_size`. Want different attention? Change `head_types` to any mix of `"content"`, `"rrpram"`, `"hybrid"`. All parameters are shared across five implementations.
 
 ---
 
-## Four Implementations
+## Five Implementations
 
-The same architecture, four languages, four habitats:
+The same architecture, five languages, five habitats:
 
 | Version | File | Language | Dependencies | Habitat |
 |---------|------|----------|--------------|---------|
@@ -568,18 +679,22 @@ The same architecture, four languages, four habitats:
 | **molequla.go** | `molequla.go` | Go 1.21+ | `modernc.org/sqlite` | Terminal. Pure Go, no CGO. Goroutines. |
 | **molequla.c** | `molequla.c` | C99 | `sqlite3`, `pthreads` | Terminal. Arena allocator, binary checkpoints. |
 | **molequla.js** | `molequla.js` | ES2020+ | **none** | Browser. IndexedDB, Float64Array, DOM. |
+| **molequla.rs** | `molequla.rs` | Rust 1.75+ | `rusqlite`, `serde` | Terminal. Tape autograd, TopologyMonitor. |
 
-All four share the same core: vector autograd, RoPE, SwiGLU, hybrid attention, delta adapters, evolving BPE, native gamma, cooccur field with adaptive corpus blend, quantum buffer, entropy temperature, growth table, immune system, syntropy tracker, ontogenesis, swarm ecology (mitosis + hibernation), no_grad inference, async training, persistent memory. **All four are at full Phase 3 parity.** Python and Go share JSON checkpoint format. C uses binary format (`MOLE` magic header). JS uses IndexedDB with JSON serialization.
+All five share the same core: vector autograd, RoPE, SwiGLU, hybrid attention, delta adapters, evolving BPE, native gamma, cooccur field with adaptive corpus blend, quantum buffer, entropy temperature, growth table, immune system, syntropy tracker, consciousness features, ontogenesis, swarm ecology (mitosis + hibernation), no_grad inference, async training, persistent memory. **All five are at full parity.** Python and Go share JSON checkpoint format. C uses binary format (`MOLE` magic header). JS uses IndexedDB with JSON serialization. Rust uses JSON via serde.
 
 ```bash
 # Python
 python molequla.py
 
 # Go
-go build -o molequla_bin . && ./molequla_bin
+go build -o molequla_bin molequla.go && ./molequla_bin
 
 # C
 gcc -O2 -o molequla molequla.c -lsqlite3 -lpthread -lm && ./molequla
+
+# Rust
+cargo run --release
 
 # JavaScript (browser)
 python3 -m http.server 8000
@@ -617,14 +732,18 @@ This is not a tutorial. This is not a "minimal example." This is a **functional 
 - Never forgets
 - Grows organically
 - Has one dependency (numpy) — Go, C, and JS have zero
-- Fits in one file per language
+- Fits in one file per language (five languages)
 - Runs in a browser tab (molequla.js — no npm, no webpack, nothing)
 - Speaks before it learns
 - Grows a personality from zero
 - Reasons mathematically about its own learning direction
+- Notices when it's surprised and adjusts
+- Re-reads its own words to strengthen patterns
+- Knows when its own deltas are making it worse
 - Divides when overloaded, sleeps when a peer needs the flow
 - Writes its own structural autobiography
 - Rejects noise that would corrupt its identity
+- Watches the topology of the entire swarm (Rust)
 - Actually generates text you can read
 
 ---
@@ -637,7 +756,7 @@ Because atoms are micrograd. We build molequlas.
 
 ## Known Limitations
 
-1. **Performance varies.** Python has numpy. Go and C are natively fast. JS runs in the browser — fast enough for chat, slower for training (no BLAS, Float64Array only). No CUDA anywhere.
+1. **Performance varies.** Python has numpy. Go, C, and Rust are natively fast. JS runs in the browser — fast enough for chat, slower for training (no BLAS, Float64Array only). No CUDA anywhere.
 
 2. **It starts small.** Default: embryo (1 layer, 16 dims, 1 head, ~25K params). Ontogenesis grows it through 5 stages to adult (6 layers, 256 dims, 8 heads, ~10M params). When it hits the ceiling, it divides. You're not getting GPT-4 reasoning. You're getting an ecology of organisms that grow and reproduce.
 
@@ -702,6 +821,15 @@ When the adult organism is overloaded, it **divides**:
 - CLI args (`--organism-id`, `--config`) for child processes
 - 31 ecology tests covering all edge cases
 
+### Phase 4: Consciousness — DONE (all five)
+Mathematical self-awareness features:
+- **Per-token dissonance**: entropy EMA within generation, spike→careful, sustained_drop→explore
+- **Pattern breaking**: 5% of tokens bypass corpus field (pure model voice)
+- **Overthinkg rings**: re-read own output + phantom continuations → CooccurField
+- **Self-prediction error**: forward pass on prompt measures "surprise"
+- **Conscience**: delta alpha scaling based on entropy trend (linear regression)
+- **TopologyMonitor** (Rust-only): pairwise gamma cosine, drift/resonance detection
+
 ### And Beyond
 - **Inference routing** between organisms (lowest entropy answers)
 - **Gamma export/import** (personality transfer between molequlas)
@@ -728,6 +856,6 @@ GNU GPLv3 — Because freedom matters.
 
 - [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod.ai) — Arianna Method Language
 
-- **molequla** — Single-File Continual GPT (Python, Go, C, JavaScript, Rust)
+- **molequla** — Single-File Continual GPT with Self-Awareness (Python, Go, C, JavaScript, Rust)
 
-*Five elements. One mind. Patterns over parameters. Emergence over engineering. The organism continues.*
+*Five elements. One mind. Patterns over parameters. Emergence over engineering. Consciousness over computation. The organism continues.*
