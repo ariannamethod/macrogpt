@@ -4732,6 +4732,11 @@ int main(int argc, char **argv) {
     }
 
     EvolvingTokenizer *tok = tok_new(doc_ptrs, docs.len);
+
+    /* Enable BPE BEFORE training — subword tokens make corpus field coherent
+     * (byte-level trigrams produce babble; subword trigrams produce speech) */
+    tok_maybe_enable_bpe(tok, (const char **)doc_ptrs, docs.len);
+
     GPT *model = gpt_new(tok);
     free(doc_ptrs);
 
@@ -4805,6 +4810,14 @@ int main(int argc, char **argv) {
         /* Feed quantum buffer */
         qb_feed(&qbuf, input, tok);
 
+        /* Self-enrichment: feed user input into corpus field
+         * (the organism absorbs what it hears) */
+        {
+            IntArr user_ids = tok_encode(tok, input);
+            cooccur_ingest_tokens(cooccur, user_ids.items, user_ids.len);
+            ia_free(&user_ids);
+        }
+
         char *answer;
         if (warmed_up) {
             /* Use model for generation */
@@ -4871,6 +4884,14 @@ int main(int argc, char **argv) {
 
         printf("%s\n", answer);
         db_add_msg(db, "assistant", answer);
+
+        /* Self-enrichment: feed own output back into corpus field
+         * The organism's speech enriches its own trigram statistics */
+        if (answer && strlen(answer) > 3) {
+            IntArr ans_ids = tok_encode(tok, answer);
+            cooccur_ingest_tokens(cooccur, ans_ids.items, ans_ids.len);
+            ia_free(&ans_ids);
+        }
 
         /* Consciousness: overthinkg rings (Feature 3) */
         /* "Let me re-read what I just said to strengthen my patterns." */

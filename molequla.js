@@ -3444,6 +3444,15 @@ async function handleUserMessage(text) {
         }
     });
 
+    // Self-enrichment: feed user input into corpus field
+    // The organism absorbs what it hears (matching Go/Rust behavior)
+    if (_field) {
+        const userIds = _tok.encode(text);
+        if (userIds.length > 0) {
+            _field.ingestTokens(userIds);
+        }
+    }
+
     const answer = _model.generateSentence(prompt) || "...";
 
     // Consciousness: conscience check (Feature 5)
@@ -3454,6 +3463,15 @@ async function handleUserMessage(text) {
 
     appendChat("molequla", answer);
     await DB.addMessage("assistant", answer);
+
+    // Self-enrichment: feed own output back into corpus field
+    // The organism's speech enriches its own trigram statistics
+    if (_field && answer.length > 3) {
+        const answerIds = _tok.encode(answer);
+        if (answerIds.length > 0) {
+            _field.ingestTokens(answerIds);
+        }
+    }
 
     // Consciousness: overthinkg rings (Feature 3)
     // "Let me re-read what I just said to strengthen my patterns."
@@ -3651,10 +3669,15 @@ async function awaken() {
         logUI("[checkpoint] Model restored from IndexedDB.");
     } else {
         tok = new EvolvingTokenizer(_corpusLines);
+
+        // Enable BPE BEFORE training — subword tokens make corpus field coherent
+        // (byte-level trigrams produce babble; subword trigrams produce speech)
+        const initDocs = _corpusLines;
+        tok.maybeEnableBpe(initDocs);
+
         model = new GPT(tok);
         // Initialize at the correct stage for corpus size, with per-stage warmup
         let initCorpusChars = _corpusLines.reduce((a, l) => a + l.length, 0);
-        const initDocs = _corpusLines;
         // Train warmup at embryo stage (stage 0) before any growth
         if (initDocs.length > 0) {
             const embryoEmbd = CFG.growthStages[0][1];

@@ -3122,6 +3122,9 @@ async def chat_main():
     model, tok = load_checkpoint(docs, CFG.ckpt_path)
     if model is None or tok is None:
         tok = EvolvingTokenizer(docs if docs else ["Hello."])
+        # Enable BPE before warmup — subword tokens for coherent corpus field
+        if docs:
+            tok.maybe_enable_bpe(docs)
         model = GPT(tok)
 
         # Initialize at the correct stage for corpus size with per-stage warmup
@@ -3188,6 +3191,10 @@ async def chat_main():
             # And lo, the reservoir shall be fed for future trainings.
             update_reservoir_corpus(con, CFG.corpus_path, CFG.max_corpus_lines)
 
+            # Self-enrichment: user input enriches corpus field (after rebuild, so it's not wiped)
+            if model._corpus_field is not None:
+                model._corpus_field.ingest_tokens(tok.encode(user_text))
+
             prompt = build_prompt_from_memory(con, user_text)
 
             # Consciousness: self-prediction error (Feature 4)
@@ -3212,6 +3219,10 @@ async def chat_main():
 
             print(answer)
             db_add_message(con, "assistant", answer)
+
+            # Self-enrichment: organism's speech enriches its own corpus field
+            if model._corpus_field is not None and len(answer) > 3:
+                model._corpus_field.ingest_tokens(tok.encode(answer))
 
             # Consciousness: overthinkg rings (Feature 3)
             # "Let me re-read what I just said to strengthen my patterns."
