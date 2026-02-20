@@ -58,11 +58,11 @@ class Config:
 
     # ontogenesis — growth stages (corpus_chars, n_embd, n_layer, n_head)
     growth_stages: tuple = (
-        (0,      16, 1, 1),      # embryo: ~25K params
-        (20000,  32, 1, 2),      # infant: ~100K params
-        (50000,  64, 2, 4),      # child: ~500K params
-        (200000, 128, 4, 4),     # adolescent: ~2M params
-        (500000, 256, 6, 8),     # adult: ~10M params
+        (0,      16, 1, 1),      # embryo: ~19K params
+        (20000,  32, 1, 2),      # infant: ~47K params
+        (50000,  64, 2, 4),      # child: ~206K params
+        (200000, 128, 4, 4),     # adolescent: ~1.3M params
+        (500000, 320, 6, 8),     # adult: ~10M params
     )
     freeze_after_growth_steps: int = 500  # freeze base weights after growth, train only deltas
     post_growth_lr_scale: float = 0.3    # LR multiplier during freeze period (prevents delta overfit to noise)
@@ -96,8 +96,8 @@ class Config:
     max_gen_tokens: int = 180
     min_gen_tokens: int = 16
     repetition_guard: int = 4
-    freq_penalty: float = 0.3
-    presence_penalty: float = 0.3
+    freq_penalty: float = 0.1
+    presence_penalty: float = 0.1
 
     # tokenizer evolution
     enable_bpe_after_chars: int = 20000  # corpus size threshold to begin learning merges
@@ -1410,6 +1410,8 @@ class GPT:
         self.lock = threading.Lock()
         self.residual_alpha = 1.0 / math.sqrt(max(1, CFG.n_layer))
         self.global_step = 0
+        self.last_warmup_stage = -1          # per-stage warmup: last stage that completed warmup
+        self.growth_step_offset = 0          # global_step at last growth event (for LR warmup reset)
         self.syntropy_temp_offset = 0.0  # temperature bridge from syntropy state
         self._growth_freeze_remaining = 0  # ontogenesis: freeze base after growth
         self._corpus_field = None  # set by background_trainer for adaptive blend
@@ -1653,6 +1655,7 @@ class GPT:
 
         # 7. Reset Adam state (old momentum is meaningless after arch change)
         self._adam = {}
+        self.growth_step_offset = self.global_step  # reset LR warmup on growth
 
         # 8. Extend gamma snapshot for new embedding dimensions
         for i in range(len(self._init_embed_snapshot)):
@@ -2361,6 +2364,8 @@ def save_checkpoint(model: GPT, tok: EvolvingTokenizer, path=None):
         "alpha": model.active_alpha,
         "init_embed_snapshot": model._init_embed_snapshot,
         "global_step": model.global_step,
+        "last_warmup_stage": model.last_warmup_stage,
+        "growth_step_offset": model.growth_step_offset,
         "deltas": []
     }
     for mod in model.deltas:
@@ -2447,6 +2452,17 @@ def load_checkpoint(docs, path=None):
         model._init_embed_snapshot = [row.data.tolist() for row in model.base["wte"].rows]
 
     model.global_step = obj.get("global_step", 0)
+    model.growth_step_offset = obj.get("growth_step_offset", 0)
+
+    # Backward compat: old checkpoints without last_warmup_stage
+    saved_warmup = obj.get("last_warmup_stage", None)
+    if saved_warmup is not None:
+        model.last_warmup_stage = saved_warmup
+    elif model.global_step > 0:
+        # Old checkpoint that has been trained — assume current stage is warmed up
+        model.last_warmup_stage = model.current_growth_stage()
+    else:
+        model.last_warmup_stage = -1
 
     return model, tok
 
@@ -2640,10 +2656,11 @@ class SyntropyTracker:
         con.commit()
 
 
-def cosine_lr(global_step):
-    """Global cosine LR with linear warmup."""
-    if global_step < CFG.cosine_warmup_steps:
-        return CFG.lr_min + (CFG.learning_rate - CFG.lr_min) * (global_step / max(1, CFG.cosine_warmup_steps))
+def cosine_lr(global_step, growth_step_offset=0):
+    """Global cosine LR with linear warmup that resets on growth."""
+    steps_since_growth = global_step - growth_step_offset
+    if steps_since_growth < CFG.cosine_warmup_steps:
+        return CFG.lr_min + (CFG.learning_rate - CFG.lr_min) * (steps_since_growth / max(1, CFG.cosine_warmup_steps))
     progress = min(1.0, global_step / max(1, CFG.max_total_steps))
     return CFG.lr_min + 0.5 * (CFG.learning_rate - CFG.lr_min) * (1.0 + math.cos(math.pi * progress))
 
@@ -2676,7 +2693,7 @@ def _train_steps_locked(model, tok, docs, steps, train_base, train_deltas):
             loss = loss * (1.0 / accum)  # scale loss for accumulation
             backward(loss)
 
-        lr = cosine_lr(model.global_step)
+        lr = cosine_lr(model.global_step, model.growth_step_offset)
         # Scale LR inversely with model size: larger models need smaller LR
         lr *= CFG.growth_stages[0][1] / model.n_embd
         # Post-growth LR dampening: reduce LR during freeze to prevent delta overfit to noise
@@ -2878,7 +2895,6 @@ def perform_hibernation(model, tok, con, swarm):
 async def background_trainer(con, model: GPT, tok: EvolvingTokenizer, swarm=None):
     # And lo, asynchronous training shall occur, because sleeping is for humans.
     last_event_id = 0
-    warmed_up = False
     qbuf = QuantumBuffer()
     syntracker = SyntropyTracker()
     field = CooccurField()
@@ -2910,20 +2926,24 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer, swarm=None
                 model.maybe_expand_vocab(tok.vocab_size)
                 save_checkpoint(model, tok)
 
-        if (not warmed_up) and docs:
+        # Per-stage warmup: if current stage > last warmed stage, run warmup
+        current_stage = model.current_growth_stage()
+        if docs and current_stage >= 0 and current_stage > model.last_warmup_stage:
+            stage_name = ["embryo", "infant", "child", "adolescent", "adult"][min(current_stage, 4)]
             embryo_embd = CFG.growth_stages[0][1]
             warmup_scale = max(1, model.n_embd // embryo_embd)
             effective_warmup = CFG.warmup_steps * warmup_scale
-            print(f"[trainer] warmup training... {effective_warmup} steps (scaled {warmup_scale}x for embd={model.n_embd})")
+            print(f"[trainer] per-stage warmup for stage {current_stage} ({stage_name})... "
+                  f"{effective_warmup} steps (scaled {warmup_scale}x for embd={model.n_embd})")
             train_steps(model, tok, docs, effective_warmup,
                         train_base=True, train_deltas=True)
+            model.last_warmup_stage = current_stage
             with model.lock:
                 save_checkpoint(model, tok)
-            db_log_growth(con, model, tok, docs, note="warmup_complete")
-            warmed_up = True
-            print("[trainer] warmup complete. base may freeze now, like a proud fossil.")
+            db_log_growth(con, model, tok, docs, note=f"warmup_complete:stage={current_stage}")
+            print(f"[trainer] warmup complete for stage {current_stage}. base may freeze now, like a proud fossil.")
 
-        if warmed_up and docs:
+        if model.last_warmup_stage >= 0 and docs:
             qbuf.feed(mass, tok, docs)
             if qbuf.should_trigger():
                 nov = qbuf.novelty_score()
@@ -3103,10 +3123,27 @@ async def chat_main():
         tok = EvolvingTokenizer(docs if docs else ["Hello."])
         model = GPT(tok)
 
-        # Initialize at the correct stage for corpus size
+        # Initialize at the correct stage for corpus size with per-stage warmup
         corpus_chars = sum(len(d) for d in docs) if docs else 0
-        while model.maybe_grow_architecture(corpus_chars):
-            model._growth_freeze_remaining = 0  # skip freeze during init
+        target_stage = model.target_growth_stage(corpus_chars)
+        current_stage = model.current_growth_stage()
+        if target_stage > current_stage and docs:
+            print(f"[init] Per-stage warmup: current={current_stage}, target={target_stage}")
+            while True:
+                stage = model.current_growth_stage()
+                stage_name = ["embryo", "infant", "child", "adolescent", "adult"][min(stage, 4)]
+                _, embd, layer, head = CFG.growth_stages[min(stage, len(CFG.growth_stages)-1)]
+                print(f"[init] Stage {stage} ({stage_name}): embd={embd}, layer={layer}, head={head}")
+                train_steps(model, tok, docs, CFG.warmup_steps)
+                model.last_warmup_stage = stage
+                save_checkpoint(model, tok)
+                if not model.maybe_grow_architecture(corpus_chars):
+                    break
+                model._growth_freeze_remaining = 0  # skip freeze during init growth
+        elif target_stage > current_stage:
+            # No docs: just grow without warmup
+            while model.maybe_grow_architecture(corpus_chars):
+                model._growth_freeze_remaining = 0
 
     # Ensure tokenizer evolution can expand model
     model.maybe_expand_vocab(tok.vocab_size)

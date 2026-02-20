@@ -120,7 +120,8 @@ impl Default for Config {
             ckpt_path: "molequla_ckpt.json".into(),
             max_corpus_lines: 8000, max_line_chars: 240, min_new_chars_to_train: 480,
             tie_embeddings: true, n_layer: 1, n_embd: 16, n_head: 1, block_size: 96,
-            growth_stages: vec![[0,16,1,1],[20000,32,1,2],[50000,64,2,4],[200000,128,4,4],[500000,256,6,8]],
+            // embryo: ~19K params, infant: ~47K params, child: ~206K params, adolescent: ~1.3M params, adult: ~10M params
+            growth_stages: vec![[0,16,1,1],[20000,32,1,2],[50000,64,2,4],[200000,128,4,4],[500000,320,6,8]],
             freeze_after_growth_steps: 500, post_growth_lr_scale: 0.3,
             warmup_steps: 1200, micro_steps: 32,
             learning_rate: 0.01, beta1: 0.9, beta2: 0.99, eps_adam: 1e-8, grad_clip: 1.0,
@@ -145,7 +146,7 @@ impl Default for Config {
             anti_field_prob: 0.05, anti_field_min_step: 8,
             overthinkc_rounds: 2, overthinkc_max_tokens: 32,
             conscience_window: 8, conscience_decay: 0.95, conscience_recovery: 1.005, conscience_floor: 0.3,
-            freq_penalty: 0.3, presence_penalty: 0.3,
+            freq_penalty: 0.1, presence_penalty: 0.1,
         }
     }
 }
@@ -702,6 +703,11 @@ impl MatrixParam {
         self.nin = new_nin;
     }
 
+    fn grow(&mut self, new_nout: usize, new_nin: usize, std: f64) {
+        self.grow_rows(new_nout, std);
+        self.grow_cols(new_nin, std);
+    }
+
     fn zero_grad(&mut self) {
         for row in self.grad.iter_mut() {
             for v in row.iter_mut() { *v = 0.0; }
@@ -778,8 +784,8 @@ fn default_conscience_window() -> usize { 8 }
 fn default_conscience_decay() -> f64 { 0.95 }
 fn default_conscience_recovery() -> f64 { 1.005 }
 fn default_conscience_floor() -> f64 { 0.3 }
-fn default_freq_penalty() -> f64 { 0.3 }
-fn default_presence_penalty() -> f64 { 0.3 }
+fn default_freq_penalty() -> f64 { 0.1 }
+fn default_presence_penalty() -> f64 { 0.1 }
 
 impl EvolvingTokenizer {
     /// Rebuild stoi and special token IDs from tokens vec (for cross-impl compat)
@@ -1020,6 +1026,8 @@ struct GPT {
     global_step: usize,
     syntropy_temp_offset: f64,
     growth_freeze_remaining: i32,
+    last_warmup_stage: i32,       // per-stage warmup: last stage that completed warmup (-1 = none)
+    growth_step_offset: usize,    // global_step at last growth event (for LR warmup reset)
     head_types: Vec<String>,
 
     // consciousness state
@@ -1077,7 +1085,8 @@ impl GPT {
             init_embed_snapshot: snapshot,
             residual_alpha: 1.0 / (nl as f64).sqrt().max(1.0),
             global_step: 0, syntropy_temp_offset: 0.0,
-            growth_freeze_remaining: 0, head_types: htypes,
+            growth_freeze_remaining: 0, last_warmup_stage: -1, growth_step_offset: 0,
+            head_types: htypes,
             delta_alpha_scale: 1.0,
             generation_entropy_history: Vec::new(),
             last_surprise: 0.0, surprise_baseline: 0.0, last_gen_entropy: 0.0,
@@ -1450,6 +1459,192 @@ impl GPT {
         }
     }
 
+    /// Return index of current stage based on model dimensions, or -1 if unknown.
+    fn current_growth_stage(&self) -> i32 {
+        for (i, stage) in self.cfg.growth_stages.iter().enumerate() {
+            if self.n_embd == stage[1] && self.n_layer == stage[2] && self.n_head == stage[3] {
+                return i as i32;
+            }
+        }
+        -1 // legacy checkpoint or unknown dims
+    }
+
+    /// Return the target stage index based on corpus size.
+    fn target_growth_stage(&self, corpus_chars: usize) -> usize {
+        let mut target = 0;
+        for (i, stage) in self.cfg.growth_stages.iter().enumerate() {
+            if corpus_chars >= stage[0] {
+                target = i;
+            }
+        }
+        target
+    }
+
+    /// Check if growth is needed and execute it. Returns true if grew.
+    fn maybe_grow_architecture(&mut self, corpus_chars: usize) -> bool {
+        let current = self.current_growth_stage();
+        if current < 0 { return false; } // legacy checkpoint, skip growth
+        if self.growth_freeze_remaining > 0 { return false; } // still stabilizing
+        let target_full = self.target_growth_stage(corpus_chars);
+        if target_full <= current as usize { return false; }
+        // Grow only one stage at a time — prevent catastrophic multi-stage jumps
+        let target = (current + 1) as usize;
+
+        let new_embd = self.cfg.growth_stages[target][1];
+        let new_layer = self.cfg.growth_stages[target][2];
+        let new_head = self.cfg.growth_stages[target][3];
+        let old_embd = self.n_embd;
+        let old_layer = self.n_layer;
+        let old_head = self.n_head;
+        let new_head_dim = new_embd / new_head;
+        let std_g = 0.001;
+
+        eprintln!("[growth] ONTOGENESIS: stage {} -> {}", current, target);
+        eprintln!("  embd: {} -> {}, layer: {} -> {}, head: {} -> {}",
+                  old_embd, new_embd, old_layer, new_layer, old_head, new_head);
+
+        // 1. Grow embedding matrices (columns = embd dimension)
+        self.base.get_mut("wte").unwrap().grow_cols(new_embd, std_g);
+        self.base.get_mut("wpe").unwrap().grow_cols(new_embd, std_g);
+        if !self.cfg.tie_embeddings {
+            if let Some(lm) = self.base.get_mut("lm_head") {
+                lm.grow_cols(new_embd, std_g);
+            }
+        }
+
+        // Update head types for new head count
+        let new_htypes = head_types_for(new_head);
+
+        // 2. Grow existing layer matrices
+        for li in 0..old_layer {
+            let p = format!("l{}", li);
+            for suffix in &["wq", "wk", "wv", "wo"] {
+                let key = format!("{}.{}", p, suffix);
+                self.base.get_mut(&key).unwrap().grow(new_embd, new_embd, std_g);
+            }
+            self.base.get_mut(&format!("{}.fc_g", p)).unwrap().grow(4 * new_embd, new_embd, std_g);
+            self.base.get_mut(&format!("{}.fc_v", p)).unwrap().grow(4 * new_embd, new_embd, std_g);
+            self.base.get_mut(&format!("{}.fc2", p)).unwrap().grow(new_embd, 4 * new_embd, std_g);
+            // Grow existing head pattern matrices
+            for h in 0..old_head {
+                let pkey = format!("{}.h{}.w_pattern", p, h);
+                if self.base.contains_key(&pkey) {
+                    self.base.get_mut(&pkey).unwrap().grow_cols(new_head_dim, std_g);
+                }
+            }
+            // Add new heads for existing layers
+            for h in old_head..new_head {
+                let htype = if h < new_htypes.len() { new_htypes[h].as_str() } else { "content" };
+                if htype == "rrpram" || htype == "hybrid" {
+                    self.base.insert(format!("{}.h{}.w_pattern", p, h),
+                        MatrixParam::new(self.block_size, new_head_dim, std_g));
+                    let mut alpha_mat = MatrixParam::zeros(1, 1);
+                    alpha_mat.data[0][0] = self.cfg.hybrid_alpha_init;
+                    self.base.insert(format!("{}.h{}.alpha", p, h), alpha_mat);
+                }
+            }
+        }
+
+        // 3. Add new layers
+        let std_l = 0.02 / (new_layer as f64).sqrt().max(1.0);
+        for li in old_layer..new_layer {
+            let p = format!("l{}", li);
+            self.base.insert(format!("{}.wq", p), MatrixParam::new(new_embd, new_embd, std_l));
+            self.base.insert(format!("{}.wk", p), MatrixParam::new(new_embd, new_embd, std_l));
+            self.base.insert(format!("{}.wv", p), MatrixParam::new(new_embd, new_embd, std_l));
+            self.base.insert(format!("{}.wo", p), MatrixParam::new(new_embd, new_embd, std_l));
+            self.base.insert(format!("{}.fc_g", p), MatrixParam::new(4 * new_embd, new_embd, std_l));
+            self.base.insert(format!("{}.fc_v", p), MatrixParam::new(4 * new_embd, new_embd, std_l));
+            self.base.insert(format!("{}.fc2", p), MatrixParam::new(new_embd, 4 * new_embd, std_l));
+            for (hi, htype) in new_htypes.iter().enumerate() {
+                if htype == "rrpram" || htype == "hybrid" {
+                    self.base.insert(format!("{}.h{}.w_pattern", p, hi),
+                        MatrixParam::new(self.block_size, new_head_dim, std_l));
+                    let mut alpha_mat = MatrixParam::zeros(1, 1);
+                    alpha_mat.data[0][0] = self.cfg.hybrid_alpha_init;
+                    self.base.insert(format!("{}.h{}.alpha", p, hi), alpha_mat);
+                }
+            }
+        }
+
+        // 4. Grow deltas
+        for dm in &mut self.deltas {
+            for li in 0..old_layer {
+                let p = format!("l{}", li);
+                for suffix in &["wq", "wk", "wv", "wo"] {
+                    let key = format!("{}.{}", p, suffix);
+                    if let Some(adapter) = dm.get_mut(&key) {
+                        adapter.grow_dims(new_embd, new_embd);
+                    }
+                }
+                let key_fg = format!("{}.fc_g", p);
+                if let Some(a) = dm.get_mut(&key_fg) { a.grow_dims(4 * new_embd, new_embd); }
+                let key_fv = format!("{}.fc_v", p);
+                if let Some(a) = dm.get_mut(&key_fv) { a.grow_dims(4 * new_embd, new_embd); }
+                let key_fc2 = format!("{}.fc2", p);
+                if let Some(a) = dm.get_mut(&key_fc2) { a.grow_dims(new_embd, 4 * new_embd); }
+                for h in 0..old_head {
+                    let pkey = format!("{}.h{}.w_pattern", p, h);
+                    if let Some(a) = dm.get_mut(&pkey) {
+                        a.b.grow_cols(new_head_dim, 0.01);
+                    }
+                }
+            }
+            // Grow lm_head delta
+            if let Some(a) = dm.get_mut("lm_head") {
+                a.grow_dims(self.tok.vocab_size, new_embd);
+            }
+            // Add deltas for new layers
+            let r = self.cfg.delta_rank;
+            let std_d = 0.01;
+            for li in old_layer..new_layer {
+                let p = format!("l{}", li);
+                for suffix in &["wq", "wk", "wv", "wo"] {
+                    dm.insert(format!("{}.{}", p, suffix), DeltaAdapter::new(new_embd, new_embd, r, std_d));
+                }
+                dm.insert(format!("{}.fc_g", p), DeltaAdapter::new(4 * new_embd, new_embd, r, std_d));
+                dm.insert(format!("{}.fc_v", p), DeltaAdapter::new(4 * new_embd, new_embd, r, std_d));
+                dm.insert(format!("{}.fc2", p), DeltaAdapter::new(new_embd, 4 * new_embd, r, std_d));
+                for (hi, htype) in new_htypes.iter().enumerate() {
+                    if htype == "rrpram" || htype == "hybrid" {
+                        dm.insert(format!("{}.h{}.w_pattern", p, hi),
+                            DeltaAdapter::new(self.block_size, new_head_dim, r, std_d));
+                    }
+                }
+            }
+        }
+
+        // 5. Update model dimensions
+        self.n_embd = new_embd;
+        self.n_layer = new_layer;
+        self.n_head = new_head;
+        self.head_dim = new_head_dim;
+        self.head_types = new_htypes;
+        self.cfg.n_embd = new_embd;
+        self.cfg.n_layer = new_layer;
+        self.cfg.n_head = new_head;
+        self.cfg.head_types = head_types_for(new_head);
+        self.residual_alpha = 1.0 / (new_layer as f64).sqrt().max(1.0);
+
+        // 6. Reset Adam state (old momentum is meaningless after arch change)
+        self.adam_base.clear();
+        self.adam_delta = (0..self.deltas.len()).map(|_| HashMap::new()).collect();
+        self.growth_step_offset = self.global_step; // reset LR warmup on growth
+
+        // 7. Extend gamma snapshot for new embedding dimensions
+        for row in self.init_embed_snapshot.iter_mut() {
+            while row.len() < new_embd {
+                row.push(0.0);
+            }
+        }
+
+        // 8. Set freeze (only train deltas until new weights stabilize)
+        self.growth_freeze_remaining = self.cfg.freeze_after_growth_steps as i32;
+
+        eprintln!("[growth] Done. Freeze for {} steps.", self.cfg.freeze_after_growth_steps);
+        true
+    }
+
     fn compute_gamma(&self) -> Vec<Vec<f64>> {
         let wte = &self.base["wte"];
         let n = wte.nout.min(self.init_embed_snapshot.len());
@@ -1803,9 +1998,10 @@ impl GPT {
 // 8) TRAINING — Adam, cosine LR, train_steps
 // ============================================================
 
-fn cosine_lr(step: usize, cfg: &Config) -> f64 {
-    if step < cfg.cosine_warmup_steps {
-        cfg.lr_min + (cfg.learning_rate - cfg.lr_min) * (step as f64 / cfg.cosine_warmup_steps as f64)
+fn cosine_lr(step: usize, growth_step_offset: usize, cfg: &Config) -> f64 {
+    let steps_since_growth = step.saturating_sub(growth_step_offset);
+    if steps_since_growth < cfg.cosine_warmup_steps {
+        cfg.lr_min + (cfg.learning_rate - cfg.lr_min) * (steps_since_growth as f64 / cfg.cosine_warmup_steps.max(1) as f64)
     } else {
         let progress = (step as f64 / cfg.max_total_steps as f64).min(1.0);
         cfg.lr_min + 0.5 * (cfg.learning_rate - cfg.lr_min) * (1.0 + (std::f64::consts::PI * progress).cos())
@@ -1854,7 +2050,7 @@ fn train_steps(model: &mut GPT, docs: &[String], steps: usize, train_base: bool,
             batch_loss = seq_loss_sum / cfg.batch_size as f64;
         }
 
-        let mut lr = cosine_lr(model.global_step, &cfg);
+        let mut lr = cosine_lr(model.global_step, model.growth_step_offset, &cfg);
         // Scale LR inversely with model size: larger models need smaller LR
         lr *= cfg.growth_stages[0][1] as f64 / model.n_embd as f64;
         // Post-growth LR dampening: reduce LR during freeze to prevent delta overfit to noise
@@ -2373,7 +2569,13 @@ struct CheckpointData {
     deltas: Vec<HashMap<String, DeltaCkpt>>, // name -> {A, B} — Go-compatible
     init_embed_snapshot: Vec<Vec<f64>>,
     global_step: usize,
+    #[serde(default = "default_last_warmup_stage")]
+    last_warmup_stage: i32,
+    #[serde(default)]
+    growth_step_offset: usize,
 }
+
+fn default_last_warmup_stage() -> i32 { -1 }
 
 fn save_checkpoint(model: &GPT, path: &str) -> std::io::Result<()> {
     let mut base_data = HashMap::new();
@@ -2393,6 +2595,8 @@ fn save_checkpoint(model: &GPT, path: &str) -> std::io::Result<()> {
         base: base_data, alpha: model.active_alpha.clone(),
         deltas: deltas_data, init_embed_snapshot: model.init_embed_snapshot.clone(),
         global_step: model.global_step,
+        last_warmup_stage: model.last_warmup_stage,
+        growth_step_offset: model.growth_step_offset,
     };
     let json = serde_json::to_string(&ckpt).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     fs::write(path, json)
@@ -2435,6 +2639,16 @@ fn load_checkpoint(path: &str) -> Result<GPT, Box<dyn std::error::Error>> {
     gpt.adam_delta = (0..gpt.deltas.len()).map(|_| HashMap::new()).collect();
     gpt.init_embed_snapshot = ckpt.init_embed_snapshot;
     gpt.global_step = ckpt.global_step;
+    gpt.growth_step_offset = ckpt.growth_step_offset;
+    // Backward compat: old checkpoints without last_warmup_stage
+    if ckpt.last_warmup_stage >= 0 {
+        gpt.last_warmup_stage = ckpt.last_warmup_stage;
+    } else if gpt.global_step > 0 {
+        // Old checkpoint that has been trained — assume current stage is warmed up
+        gpt.last_warmup_stage = gpt.current_growth_stage();
+    } else {
+        gpt.last_warmup_stage = -1;
+    }
     Ok(gpt)
 }
 
@@ -2502,24 +2716,37 @@ fn background_trainer(
         }
     }
 
-    // Warmup — scale steps by model size (larger models need more training)
-    let effective_warmup = cfg.warmup_steps * {
-        let m = model.lock().unwrap();
-        let embryo_embd = cfg.growth_stages[0][1];
-        let scale = m.n_embd / embryo_embd.max(1);
-        scale.max(1)
-    };
-    eprintln!("[molequla.rs] Warmup: {} steps (scaled for embd)...", effective_warmup);
-    {
-        let mut m = model.lock().unwrap();
-        train_steps(&mut m, &docs, effective_warmup, true, true);
-    }
-    eprintln!("[molequla.rs] Warmup complete. Entering quantum burst loop.");
+    eprintln!("[molequla.rs] Entering quantum burst loop.");
 
     // Burst loop
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(std::time::Duration::from_secs_f64(cfg.train_tick_seconds));
         tick += 1;
+
+        // Per-stage warmup: if current stage > last warmed stage, run warmup
+        {
+            let mut m = model.lock().unwrap();
+            let current_stage = m.current_growth_stage();
+            if !docs.is_empty() && current_stage >= 0 && current_stage > m.last_warmup_stage {
+                let stage_names = ["embryo", "infant", "child", "adolescent", "adult"];
+                let stage_name = stage_names[current_stage as usize % stage_names.len()];
+                let embryo_embd = cfg.growth_stages[0][1];
+                let warmup_scale = (m.n_embd / embryo_embd.max(1)).max(1);
+                let effective_warmup = cfg.warmup_steps * warmup_scale;
+                eprintln!("[trainer] per-stage warmup for stage {} ({})... {} steps (scaled {}x for embd={})",
+                          current_stage, stage_name, effective_warmup, warmup_scale, m.n_embd);
+                train_steps(&mut m, &docs, effective_warmup, true, true);
+                m.last_warmup_stage = current_stage;
+                save_checkpoint(&m, &cfg.ckpt_path).ok();
+                eprintln!("[trainer] warmup complete for stage {}.", current_stage);
+            }
+        }
+
+        // Only burst if past initial warmup
+        {
+            let m = model.lock().unwrap();
+            if m.last_warmup_stage < 0 || docs.is_empty() { continue; }
+        }
 
         let should_burst = qbuf.lock().unwrap().should_trigger(&cfg);
         if !should_burst { continue; }
@@ -2841,7 +3068,7 @@ fn main() {
         docs.iter().map(|d| d.len()).sum::<usize>());
 
     // Try loading checkpoint, else create new
-    let model = if std::path::Path::new(&cfg.ckpt_path).exists() {
+    let mut model = if std::path::Path::new(&cfg.ckpt_path).exists() {
         match load_checkpoint(&cfg.ckpt_path) {
             Ok(m) => { eprintln!("[init] Loaded checkpoint, step={}", m.global_step); m },
             Err(e) => { eprintln!("[init] Checkpoint load failed: {}, starting fresh", e);
@@ -2852,6 +3079,28 @@ fn main() {
         let tok = EvolvingTokenizer::new(&docs);
         GPT::new(tok, &cfg)
     };
+
+    // Per-stage warmup: grow model to match corpus size, warming up at each stage
+    let corpus_chars: usize = docs.iter().map(|d| d.len()).sum();
+    let target_stage = model.target_growth_stage(corpus_chars);
+    let current_stage = model.current_growth_stage();
+    if target_stage > current_stage as usize && !docs.is_empty() {
+        let stage_names = ["embryo", "infant", "child", "adolescent", "adult"];
+        eprintln!("[init] Per-stage warmup: current={}, target={}", current_stage, target_stage);
+        loop {
+            let stage = model.current_growth_stage();
+            let stage_name = stage_names[stage.max(0) as usize % stage_names.len()];
+            eprintln!("[init] Stage {} ({}): embd={}, warmup {} steps",
+                      stage, stage_name, model.n_embd, cfg.warmup_steps);
+            train_steps(&mut model, &docs, cfg.warmup_steps, true, true);
+            model.last_warmup_stage = stage;
+            save_checkpoint(&model, &cfg.ckpt_path).ok();
+            if !model.maybe_grow_architecture(corpus_chars) { break; }
+            model.growth_freeze_remaining = 0; // skip freeze during init growth
+        }
+        eprintln!("[init] Per-stage warmup complete. Stage={}", model.current_growth_stage());
+    }
+
     let model = Arc::new(Mutex::new(model));
 
     // Build corpus field

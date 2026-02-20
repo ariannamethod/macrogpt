@@ -225,19 +225,19 @@ static Config CFG = {
 
     /* Phase 3A: ontogenesis growth stages */
     .growth_stages = {
-        {0,      16, 1, 1},    /* embryo */
-        {20000,  32, 1, 2},    /* infant */
-        {50000,  64, 2, 4},    /* child */
-        {200000, 128, 4, 4},   /* adolescent */
-        {500000, 256, 6, 8},   /* adult */
+        {0,      16, 1, 1},    /* embryo: ~19K params */
+        {20000,  32, 1, 2},    /* infant: ~47K params */
+        {50000,  64, 2, 4},    /* child: ~206K params */
+        {200000, 128, 4, 4},   /* adolescent: ~1.3M params */
+        {500000, 320, 6, 8},   /* adult: ~10M params */
     },
     .n_growth_stages = 5,
     .freeze_after_growth_steps = 500,
     .post_growth_lr_scale = 0.3,
 
     /* frequency / presence penalty */
-    .freq_penalty = 0.3,
-    .presence_penalty = 0.3,
+    .freq_penalty = 0.1,
+    .presence_penalty = 0.1,
 
     /* consciousness defaults */
     .dissonance_ema_alpha = 0.3,
@@ -1940,6 +1940,8 @@ typedef struct {
 
     /* Phase 3A: ontogenesis — growth freeze counter */
     int growth_freeze_remaining;
+    int last_warmup_stage;      /* last stage that received warmup training (-1 = none) */
+    int growth_step_offset;     /* global_step at last growth event (for LR warmup reset) */
 
     /* Adaptive corpus blend: set by background_trainer */
     CooccurField *corpus_field;
@@ -2020,6 +2022,8 @@ static GPT *gpt_new(EvolvingTokenizer *tok) {
     g->global_step = 0;
     g->syntropy_temp_offset = 0.0;
     g->growth_freeze_remaining = 0;
+    g->last_warmup_stage = -1;
+    g->growth_step_offset = 0;
     g->delta_alpha_scale = 1.0; /* conscience: full delta influence by default */
     g->gen_entropy_count = 0;
     g->last_surprise = 0.0;
@@ -2340,6 +2344,9 @@ static int gpt_maybe_grow_architecture(GPT *g, int corpus_chars) {
 
     /* 9. Set freeze (only train deltas until new weights stabilize) */
     g->growth_freeze_remaining = CFG.freeze_after_growth_steps;
+
+    /* 10. Reset LR warmup: cosine_lr uses growth_step_offset for linear warmup phase */
+    g->growth_step_offset = g->global_step;
 
     printf("[growth] Done. Freeze for %d steps.\n", CFG.freeze_after_growth_steps);
     return 1;
@@ -4008,10 +4015,13 @@ static void syntropy_log_to_db(SyntropyTracker *st, sqlite3 *db,
  * 9) TRAINING
  * ============================================================ */
 
-static double cosine_lr(int global_step) {
-    if (global_step < CFG.cosine_warmup_steps) {
+static double cosine_lr(int global_step, int growth_step_offset) {
+    /* Use steps-since-last-growth for warmup phase (resets warmup after each growth) */
+    int warmup_step = global_step - growth_step_offset;
+    if (warmup_step < 0) warmup_step = 0;
+    if (warmup_step < CFG.cosine_warmup_steps) {
         /* Linear warmup from lr_min to learning_rate */
-        double t = (double)global_step / (double)(CFG.cosine_warmup_steps > 0 ? CFG.cosine_warmup_steps : 1);
+        double t = (double)warmup_step / (double)(CFG.cosine_warmup_steps > 0 ? CFG.cosine_warmup_steps : 1);
         return CFG.lr_min + t * (CFG.learning_rate - CFG.lr_min);
     }
     double progress = (double)global_step / (double)(CFG.max_total_steps > 0 ? CFG.max_total_steps : 1);
@@ -4042,7 +4052,7 @@ static void train_steps(GPT *g, EvolvingTokenizer *tok, StrArr *docs, int steps,
         total_loss = scalar_mulf(total_loss, 1.0 / batch);
         backward(total_loss);
 
-        double lr = cosine_lr(g->global_step);
+        double lr = cosine_lr(g->global_step, g->growth_step_offset);
         /* Scale LR inversely with model size: larger models need smaller LR */
         lr *= (double)CFG.growth_stages[0][1] / (double)g->n_embd;
 
@@ -4120,6 +4130,11 @@ static void save_checkpoint(GPT *g, EvolvingTokenizer *tok, const char *path) {
         for (int r = 0; r < g->base_mats[i]->nout; r++)
             fwrite(g->base_mats[i]->row_data[r], sizeof(double), g->base_mats[i]->nin, f);
     }
+
+    /* Model metadata (global_step, warmup stage, growth offset) */
+    fwrite(&g->global_step, 4, 1, f);
+    fwrite(&g->last_warmup_stage, 4, 1, f);
+    fwrite(&g->growth_step_offset, 4, 1, f);
 
     /* Deltas */
     fwrite(&g->n_deltas, 4, 1, f);
@@ -4472,17 +4487,27 @@ static void *background_trainer(void *arg) {
             }
         }
 
-        if (!*ctx->warmed_up && docs.len > 0) {
-            int embryo_embd = CFG.growth_stages[0][1];
-            int warmup_scale = ctx->model->n_embd / (embryo_embd > 0 ? embryo_embd : 16);
-            if (warmup_scale < 1) warmup_scale = 1;
-            int effective_warmup = CFG.warmup_steps * warmup_scale;
-            printf("[trainer] warmup training... %d steps (scaled %dx for embd=%d)\n", effective_warmup, warmup_scale, ctx->model->n_embd);
-            train_steps(ctx->model, ctx->tok, &docs, effective_warmup, 1, 1);
-            save_checkpoint(ctx->model, ctx->tok, NULL);
-            db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, 0.0, "warmup_complete");
-            *ctx->warmed_up = 1;
-            printf("[trainer] warmup complete. base may freeze now, like a proud fossil.\n");
+        /* Per-stage warmup: if model grew to a new stage, warmup before normal training */
+        {
+            int current_stage = gpt_current_growth_stage(ctx->model);
+            if (current_stage > ctx->model->last_warmup_stage && docs.len > 0) {
+                int embryo_embd = CFG.growth_stages[0][1];
+                int warmup_scale = ctx->model->n_embd / (embryo_embd > 0 ? embryo_embd : 16);
+                if (warmup_scale < 1) warmup_scale = 1;
+                int effective_warmup = CFG.warmup_steps * warmup_scale;
+                printf("[trainer] stage %d warmup... %d steps (scaled %dx for embd=%d)\n",
+                       current_stage, effective_warmup, warmup_scale, ctx->model->n_embd);
+                train_steps(ctx->model, ctx->tok, &docs, effective_warmup, 1, 1);
+                ctx->model->last_warmup_stage = current_stage;
+                save_checkpoint(ctx->model, ctx->tok, NULL);
+                db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, 0.0, "warmup_complete");
+                if (!*ctx->warmed_up) {
+                    *ctx->warmed_up = 1;
+                    printf("[trainer] initial warmup complete. base may freeze now, like a proud fossil.\n");
+                } else {
+                    printf("[trainer] stage %d warmup complete.\n", current_stage);
+                }
+            }
         }
 
         if (*ctx->warmed_up && qb_should_trigger(ctx->qbuf) && docs.len > 0) {
@@ -4709,12 +4734,19 @@ int main(int argc, char **argv) {
     GPT *model = gpt_new(tok);
     free(doc_ptrs);
 
-    /* Initialize at the correct stage for corpus size */
+    /* Initialize at the correct stage for corpus size — per-stage warmup */
     {
         int corpus_chars = 0;
         for (int i = 0; i < docs.len; i++) corpus_chars += (int)strlen(docs.items[i]);
-        while (gpt_maybe_grow_architecture(model, corpus_chars)) {
-            model->growth_freeze_remaining = 0; /* skip freeze during init */
+        for (;;) {
+            int stage = gpt_current_growth_stage(model);
+            printf("[init] Stage %d: embd=%d — warmup %d steps\n",
+                   stage, model->n_embd, CFG.warmup_steps);
+            train_steps(model, tok, &docs, CFG.warmup_steps, 1, 1);
+            model->last_warmup_stage = stage;
+            save_checkpoint(model, tok, NULL);
+            if (!gpt_maybe_grow_architecture(model, corpus_chars)) break;
+            model->growth_freeze_remaining = 0; /* skip freeze during init growth */
         }
     }
 

@@ -179,11 +179,11 @@ var CFG = Config{
 	BlockSize:            96,
 
 	GrowthStages: [][4]int{
-		{0, 16, 1, 1},       // embryo: ~25K params
-		{20000, 32, 1, 2},   // infant: ~100K params
-		{50000, 64, 2, 4},   // child: ~500K params
-		{200000, 128, 4, 4}, // adolescent: ~2M params
-		{500000, 256, 6, 8}, // adult: ~10M params
+		{0, 16, 1, 1},       // embryo: ~19K params
+		{20000, 32, 1, 2},   // infant: ~47K params
+		{50000, 64, 2, 4},   // child: ~206K params
+		{200000, 128, 4, 4}, // adolescent: ~1.3M params
+		{500000, 320, 6, 8}, // adult: ~10M params
 	},
 	FreezeAfterGrowthSteps: 500,
 	PostGrowthLRScale:      0.3,
@@ -4703,6 +4703,7 @@ func parseCLIArgs() (organismID string, configPath string) {
 	}
 	return
 }
+
 
 // cosineLR returns learning rate for the given global step using cosine schedule with linear warmup.
 // stepsSinceGrowth enables LR ramp-up after each growth event (new weights need high LR initially).

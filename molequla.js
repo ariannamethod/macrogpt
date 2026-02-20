@@ -46,11 +46,11 @@ const CFG = {
 
     // ontogenesis — growth stages [corpus_chars, n_embd, n_layer, n_head]
     growthStages: [
-        [0,      16, 1, 1],    // embryo: ~25K params
-        [20000,  32, 1, 2],    // infant: ~100K params
-        [50000,  64, 2, 4],    // child: ~500K params
-        [200000, 128, 4, 4],   // adolescent: ~2M params
-        [500000, 256, 6, 8],   // adult: ~10M params
+        [0,      16, 1, 1],    // embryo: ~19K params
+        [20000,  32, 1, 2],    // infant: ~47K params
+        [50000,  64, 2, 4],    // child: ~206K params
+        [200000, 128, 4, 4],   // adolescent: ~1.3M params
+        [500000, 320, 6, 8],   // adult: ~10M params
     ],
     freezeAfterGrowthSteps: 500,
     postGrowthLRScale: 0.3,          // LR multiplier during freeze period
@@ -154,8 +154,8 @@ const CFG = {
     conscienceFloor: 0.3,
 
     // frequency/presence penalty
-    freqPenalty: 0.3,
-    presencePenalty: 0.3,
+    freqPenalty: 0.1,
+    presencePenalty: 0.1,
 };
 
 function headTypesForNHead(n) {
@@ -1624,6 +1624,10 @@ class GPT {
         // ontogenesis: freeze base after growth
         this._growthFreezeRemaining = 0;
 
+        // per-stage warmup tracking
+        this.lastWarmupStage = -1;
+        this.growthStepOffset = 0;
+
         // adaptive corpus blend: set by trainerTick
         this._corpusField = null;
 
@@ -1861,6 +1865,9 @@ class GPT {
 
         // 9. Set freeze (only train deltas until new weights stabilize)
         this._growthFreezeRemaining = CFG.freezeAfterGrowthSteps;
+
+        // 10. Reset LR warmup phase for the new architecture
+        this.growthStepOffset = this.globalStep;
 
         logUI(`[growth] Done. Freeze for ${CFG.freezeAfterGrowthSteps} steps.`);
         return true;
@@ -2661,6 +2668,8 @@ async function saveCheckpoint(model, tok) {
             nLayer: model.nLayer,
             nHead: model.nHead,
             growthFreezeRemaining: model._growthFreezeRemaining,
+            lastWarmupStage: model.lastWarmupStage,
+            growthStepOffset: model.growthStepOffset,
         },
     };
     for (const key in model.base) {
@@ -2726,6 +2735,12 @@ async function loadCheckpoint(docs) {
         model._growthFreezeRemaining = obj.modelDims.growthFreezeRemaining;
     }
 
+    // Restore per-stage warmup tracking (backward compat: default to -1 / 0)
+    if (obj.modelDims) {
+        model.lastWarmupStage = (obj.modelDims.lastWarmupStage != null) ? obj.modelDims.lastWarmupStage : -1;
+        model.growthStepOffset = obj.modelDims.growthStepOffset || 0;
+    }
+
     // Restore base
     model.base = {};
     for (const key in obj.base) {
@@ -2780,14 +2795,15 @@ async function loadCheckpoint(docs) {
 // 9) TRAINING — warmup, then continual micro-bursts
 // ============================================================
 
-function cosineLR(globalStep) {
+function cosineLR(globalStep, growthStepOffset) {
     const lrMax = CFG.learningRate;
     const lrMin = CFG.lrMin;
-    if (globalStep < CFG.cosineWarmupSteps) {
-        // Linear warmup
-        return lrMin + (lrMax - lrMin) * (globalStep / Math.max(1, CFG.cosineWarmupSteps));
+    const stepsSinceGrowth = globalStep - (growthStepOffset || 0);
+    if (stepsSinceGrowth < CFG.cosineWarmupSteps) {
+        // Linear warmup (resets after each growth event)
+        return lrMin + (lrMax - lrMin) * (stepsSinceGrowth / Math.max(1, CFG.cosineWarmupSteps));
     }
-    const progress = (globalStep - CFG.cosineWarmupSteps) /
+    const progress = (stepsSinceGrowth - CFG.cosineWarmupSteps) /
         Math.max(1, CFG.maxTotalSteps - CFG.cosineWarmupSteps);
     return lrMin + 0.5 * (lrMax - lrMin) * (1 + Math.cos(Math.PI * Math.min(progress, 1.0)));
 }
@@ -2820,7 +2836,7 @@ function trainSteps(model, tok, docs, steps, trainBase, trainDeltas) {
             else accumLoss += loss.data;
         }
 
-        let lr = cosineLR(model.globalStep);
+        let lr = cosineLR(model.globalStep, model.growthStepOffset);
         // Scale LR inversely with model size: larger models need smaller LR
         lr *= CFG.growthStages[0][1] / model.nEmbd;
         // Post-growth LR dampening: reduce LR during freeze to prevent delta overfit to noise
@@ -3195,7 +3211,7 @@ let _model = null;
 let _tok = null;
 let _field = null;
 let _trainerRunning = false;
-let _warmedUp = false;
+// _warmedUp replaced by per-stage model.lastWarmupStage
 let _lastEventId = 0;
 let _qbuf = null;
 let _syntracker = null;
@@ -3227,13 +3243,14 @@ async function trainerTick() {
                   ` | vocab=${_tok.vocabSize}`);
         }
 
-        // Warmup
-        if (!_warmedUp && docs.length > 0) {
+        // Per-stage warmup: if model grew past last warmed-up stage, run warmup for current stage
+        const currentStage = _model.currentGrowthStage();
+        if (currentStage > _model.lastWarmupStage && docs.length > 0) {
             const embryoEmbd = CFG.growthStages[0][1];
             const warmupScale = Math.max(1, Math.floor(_model.nEmbd / embryoEmbd));
             const effectiveWarmup = CFG.warmupSteps * warmupScale;
-            logUI(`[trainer] warmup training... ${effectiveWarmup} steps (scaled ${warmupScale}x for embd=${_model.nEmbd})`);
-            setStatus("warming up...");
+            logUI(`[trainer] warmup stage ${currentStage} (embd=${_model.nEmbd})... ${effectiveWarmup} steps (scaled ${warmupScale}x)`);
+            setStatus(`warming up stage ${currentStage}...`);
 
             // Do warmup in chunks to avoid freezing UI
             const chunkSize = 50;
@@ -3245,15 +3262,15 @@ async function trainerTick() {
                 if (!_trainerRunning) return;
             }
 
+            _model.lastWarmupStage = currentStage;
             await saveCheckpoint(_model, _tok);
-            await dbLogGrowth(_model, _tok, docs, 0, "warmup_complete");
-            _warmedUp = true;
-            logUI("[trainer] warmup complete. base may freeze now, like a proud fossil.");
+            await dbLogGrowth(_model, _tok, docs, 0, `warmup_complete:stage=${currentStage}`);
+            logUI(`[trainer] warmup stage ${currentStage} complete.`);
             setStatus("alive");
         }
 
-        // Continual micro-bursts
-        if (_warmedUp && docs.length > 0) {
+        // Continual micro-bursts (gated on at least one warmup completed)
+        if (_model.lastWarmupStage >= 0 && docs.length > 0) {
             _qbuf.feed(mass, _tok, docs);
 
             if (_qbuf.shouldTrigger()) {
@@ -3634,10 +3651,42 @@ async function awaken() {
     } else {
         tok = new EvolvingTokenizer(_corpusLines);
         model = new GPT(tok);
-        // Initialize at the correct stage for corpus size
+        // Initialize at the correct stage for corpus size, with per-stage warmup
         let initCorpusChars = _corpusLines.reduce((a, l) => a + l.length, 0);
+        const initDocs = _corpusLines;
+        // Train warmup at embryo stage (stage 0) before any growth
+        if (initDocs.length > 0) {
+            const embryoEmbd = CFG.growthStages[0][1];
+            const warmupScale0 = Math.max(1, Math.floor(model.nEmbd / embryoEmbd));
+            const effectiveWarmup0 = CFG.warmupSteps * warmupScale0;
+            logUI(`[init] warmup stage 0 (embryo): ${effectiveWarmup0} steps`);
+            setStatus("init warmup stage 0...");
+            const chunkSize = 50;
+            for (let start = 0; start < effectiveWarmup0; start += chunkSize) {
+                const steps = Math.min(chunkSize, effectiveWarmup0 - start);
+                trainSteps(model, tok, initDocs, steps, true, true);
+                await new Promise(r => setTimeout(r, 0));
+            }
+            model.lastWarmupStage = 0;
+        }
+        // Grow stage by stage, warming up at each new stage
         while (model.maybeGrowArchitecture(initCorpusChars)) {
             model._growthFreezeRemaining = 0; // skip freeze during init
+            const stage = model.currentGrowthStage();
+            if (initDocs.length > 0) {
+                const embryoEmbd = CFG.growthStages[0][1];
+                const warmupScale = Math.max(1, Math.floor(model.nEmbd / embryoEmbd));
+                const effectiveWarmup = CFG.warmupSteps * warmupScale;
+                logUI(`[init] warmup stage ${stage} (embd=${model.nEmbd}): ${effectiveWarmup} steps`);
+                setStatus(`init warmup stage ${stage}...`);
+                const chunkSize = 50;
+                for (let start = 0; start < effectiveWarmup; start += chunkSize) {
+                    const steps = Math.min(chunkSize, effectiveWarmup - start);
+                    trainSteps(model, tok, initDocs, steps, true, true);
+                    await new Promise(r => setTimeout(r, 0));
+                }
+                model.lastWarmupStage = stage;
+            }
         }
         logUI(`[init] Fresh model created. vocab=${tok.vocabSize}, embd=${model.nEmbd}, layers=${model.nLayer}`);
     }
