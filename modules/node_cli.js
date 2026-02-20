@@ -282,13 +282,14 @@ async function main() {
         console.log(`[bpe] Enabled. vocab=${tok.vocabSize}`);
     }
 
-    // Warmup training — scale by number of layers
-    const nLayer = model.nLayer || 1;
-    const effectiveWarmup = CFG.warmupSteps * nLayer;
+    // Warmup training — scale by model size
+    const embryoEmbd = (CFG.growthStages || [[0,16]])[0][1];
+    const warmupScale = Math.max(1, Math.floor((model.nEmbd || 16) / embryoEmbd));
+    const effectiveWarmup = CFG.warmupSteps * warmupScale;
     const startStep = model.globalStep || 0;
     const remaining = Math.max(0, effectiveWarmup - startStep);
     if (remaining > 0) {
-        console.log(`[trainer] Warmup: ${remaining} steps (scaled for ${nLayer} layers) from step ${startStep}...`);
+        console.log(`[trainer] Warmup: ${remaining} steps (scaled ${warmupScale}x for embd=${model.nEmbd}) from step ${startStep}...`);
         nodeTrainSteps(model, tok, corpusLines, remaining, 100);
         console.log("[trainer] Warmup complete.");
         saveCheckpoint(model, tok);

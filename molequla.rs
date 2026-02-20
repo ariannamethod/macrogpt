@@ -2403,12 +2403,14 @@ fn background_trainer(
         }
     }
 
-    // Warmup — scale steps by number of layers (more layers need more training)
+    // Warmup — scale steps by model size (larger models need more training)
     let effective_warmup = cfg.warmup_steps * {
         let m = model.lock().unwrap();
-        m.n_layer
+        let embryo_embd = cfg.growth_stages[0][1];
+        let scale = m.n_embd / embryo_embd.max(1);
+        scale.max(1)
     };
-    eprintln!("[molequla.rs] Warmup: {} steps (scaled for layers)...", effective_warmup);
+    eprintln!("[molequla.rs] Warmup: {} steps (scaled for embd)...", effective_warmup);
     {
         let mut m = model.lock().unwrap();
         train_steps(&mut m, &docs, effective_warmup, true, true);

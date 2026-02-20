@@ -4411,8 +4411,11 @@ static void *background_trainer(void *arg) {
         }
 
         if (!*ctx->warmed_up && docs.len > 0) {
-            int effective_warmup = CFG.warmup_steps * ctx->model->n_layer;
-            printf("[trainer] warmup training... %d steps (scaled for %d layers)\n", effective_warmup, ctx->model->n_layer);
+            int embryo_embd = CFG.growth_stages[0][1];
+            int warmup_scale = ctx->model->n_embd / (embryo_embd > 0 ? embryo_embd : 16);
+            if (warmup_scale < 1) warmup_scale = 1;
+            int effective_warmup = CFG.warmup_steps * warmup_scale;
+            printf("[trainer] warmup training... %d steps (scaled %dx for embd=%d)\n", effective_warmup, warmup_scale, ctx->model->n_embd);
             train_steps(ctx->model, ctx->tok, &docs, effective_warmup, 1, 1);
             save_checkpoint(ctx->model, ctx->tok, NULL);
             db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, 0.0, "warmup_complete");

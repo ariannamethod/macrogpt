@@ -4742,8 +4742,11 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 		}
 
 		if !warmedUp && len(docs) > 0 {
-			effectiveWarmup := CFG.WarmupSteps * model.NLayer
-			fmt.Printf("[trainer] warmup training... %d steps (scaled for %d layers)\n", effectiveWarmup, model.NLayer)
+			embryoEmbd := CFG.GrowthStages[0][1]
+			warmupScale := model.NEmbd / embryoEmbd
+			if warmupScale < 1 { warmupScale = 1 }
+			effectiveWarmup := CFG.WarmupSteps * warmupScale
+			fmt.Printf("[trainer] warmup training... %d steps (scaled %dx for embd=%d)\n", effectiveWarmup, warmupScale, model.NEmbd)
 			trainSteps(model, tok, docs, effectiveWarmup, true, true)
 			SaveCheckpoint(model, tok, "")
 			dbLogGrowth(db, model, tok, docs, 0.0, "warmup_complete")

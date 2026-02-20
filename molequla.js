@@ -3208,8 +3208,10 @@ async function trainerTick() {
 
         // Warmup
         if (!_warmedUp && docs.length > 0) {
-            const effectiveWarmup = CFG.warmupSteps * _model.nLayer;
-            logUI(`[trainer] warmup training... ${effectiveWarmup} steps (scaled for ${_model.nLayer} layers)`);
+            const embryoEmbd = CFG.growthStages[0][1];
+            const warmupScale = Math.max(1, Math.floor(_model.nEmbd / embryoEmbd));
+            const effectiveWarmup = CFG.warmupSteps * warmupScale;
+            logUI(`[trainer] warmup training... ${effectiveWarmup} steps (scaled ${warmupScale}x for embd=${_model.nEmbd})`);
             setStatus("warming up...");
 
             // Do warmup in chunks to avoid freezing UI

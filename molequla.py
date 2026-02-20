@@ -2867,8 +2867,10 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer, swarm=None
                 save_checkpoint(model, tok)
 
         if (not warmed_up) and docs:
-            effective_warmup = CFG.warmup_steps * model.n_layer
-            print(f"[trainer] warmup training... {effective_warmup} steps (scaled for {model.n_layer} layers)")
+            embryo_embd = CFG.growth_stages[0][1]
+            warmup_scale = max(1, model.n_embd // embryo_embd)
+            effective_warmup = CFG.warmup_steps * warmup_scale
+            print(f"[trainer] warmup training... {effective_warmup} steps (scaled {warmup_scale}x for embd={model.n_embd})")
             train_steps(model, tok, docs, effective_warmup,
                         train_base=True, train_deltas=True)
             with model.lock:
