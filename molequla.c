@@ -4190,11 +4190,13 @@ static GPT *load_checkpoint(const char *path, EvolvingTokenizer **out_tok) {
         for (int i = 0; i < tok->n_merges; i++) {
             int la, lb;
             fread(&la, 4, 1, f);
-            if (la > 63) la = 63;
-            fread(tok->merges[i].a, 1, la, f); tok->merges[i].a[la] = 0;
+            int la_cap = la > 63 ? 63 : la;
+            fread(tok->merges[i].a, 1, la_cap, f); tok->merges[i].a[la_cap] = 0;
+            if (la > la_cap) fseek(f, la - la_cap, SEEK_CUR);
             fread(&lb, 4, 1, f);
-            if (lb > 63) lb = 63;
-            fread(tok->merges[i].b, 1, lb, f); tok->merges[i].b[lb] = 0;
+            int lb_cap = lb > 63 ? 63 : lb;
+            fread(tok->merges[i].b, 1, lb_cap, f); tok->merges[i].b[lb_cap] = 0;
+            if (lb > lb_cap) fseek(f, lb - lb_cap, SEEK_CUR);
         }
     }
     fread(&tok->trained_chars, 4, 1, f);
@@ -4300,8 +4302,10 @@ static GPT *load_checkpoint(const char *path, EvolvingTokenizer **out_tok) {
         DeltaModule *mod = g->deltas[d];
         for (int a = 0; a < count; a++) {
             int nlen; fread(&nlen, 4, 1, f);
-            char aname[128]; if (nlen > 127) nlen = 127;
-            fread(aname, 1, nlen, f); aname[nlen] = 0;
+            int nlen_cap = nlen > 127 ? 127 : nlen;
+            char aname[128];
+            fread(aname, 1, nlen_cap, f); aname[nlen_cap] = 0;
+            if (nlen > nlen_cap) fseek(f, nlen - nlen_cap, SEEK_CUR);
             /* Format: A_nout, A_nin, A_data, B_nout, B_nin, B_data */
             int ao, ai; fread(&ao, 4, 1, f); fread(&ai, 4, 1, f);
             DeltaAdapter *da = dmod_get(mod, aname);

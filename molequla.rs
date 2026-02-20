@@ -2656,6 +2656,10 @@ fn load_checkpoint(path: &str) -> Result<GPT, Box<dyn std::error::Error>> {
         let mut dm = DeltaModule::new();
         for (name, dc) in dm_data {
             let a_data = &dc.A; let b_data = &dc.B;
+            if a_data.is_empty() || a_data[0].is_empty() || b_data.is_empty() || b_data[0].is_empty() {
+                eprintln!("[checkpoint] skipping malformed delta adapter '{}'", name);
+                continue;
+            }
             let mut a = MatrixParam { data: a_data.clone(), grad: vec![vec![0.0; a_data[0].len()]; a_data.len()], nout: a_data.len(), nin: a_data[0].len() };
             let mut b = MatrixParam { data: b_data.clone(), grad: vec![vec![0.0; b_data[0].len()]; b_data.len()], nout: b_data.len(), nin: b_data[0].len() };
             a.ensure_grad(); b.ensure_grad();
@@ -2812,16 +2816,22 @@ fn background_trainer(
         // Immune system: snapshot gamma direction
         let (pre_dir, pre_mag) = m.gamma_contrastive_projection();
 
-        // Apply syntropy-adjusted learning rate
+        // Apply syntropy-adjusted learning rate (panic-safe restore)
         let original_lr = cfg.learning_rate;
         cfg.learning_rate = original_lr * decision.lr_multiplier;
 
         // Train micro-burst
         let steps = cfg.micro_steps;
-        train_steps(&mut m, &docs, steps, !cfg.freeze_base_after_warmup, true);
+        let train_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            train_steps(&mut m, &docs, steps, !cfg.freeze_base_after_warmup, true);
+        }));
 
-        // Restore LR
+        // Always restore LR, even after panic
         cfg.learning_rate = original_lr;
+
+        if let Err(e) = train_result {
+            eprintln!("[trainer] panic in train_steps: {:?}", e);
+        }
 
         // Immune check
         if pre_mag > cfg.gamma_min_magnitude {
