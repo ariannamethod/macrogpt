@@ -27,12 +27,16 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/ariannamethod/molequla/accel"
 	_ "modernc.org/sqlite"
 )
 
 // And lo, when the organism speaks, it shall not waste breath building
 // a backward graph it will never use. gradEnabled is mercy for inference.
 var gradEnabled atomic.Bool
+
+// BLAS buffer pool — reusable contiguous memory for Matvec acceleration
+var accelBufPool = sync.Pool{New: func() any { return make([]float64, 0) }}
 
 func init() { gradEnabled.Store(true) }
 
@@ -736,6 +740,24 @@ func (m *MatrixParam) Matvec(x *Vec) *Vec {
 	nout := m.Nout
 	nin := len(x.Data)
 	outData := make([]float64, nout)
+
+	// BLAS fast path: cblas_dgemv for inference (no autograd needed)
+	if accel.HasAccel && !gradEnabled.Load() && nout*nin >= 256 {
+		needed := nout * nin
+		buf := accelBufPool.Get().([]float64)
+		if cap(buf) < needed {
+			buf = make([]float64, needed)
+		} else {
+			buf = buf[:needed]
+		}
+		for i := 0; i < nout; i++ {
+			copy(buf[i*nin:], m.Rows[i].Data[:nin])
+		}
+		accel.Dgemv(nout, nin, buf, x.Data, outData)
+		accelBufPool.Put(buf[:0])
+		return NewVec(outData)
+	}
+
 	for i := 0; i < nout; i++ {
 		sum := 0.0
 		for j := 0; j < nin; j++ {
