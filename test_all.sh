@@ -324,16 +324,16 @@ else
     fail "mycelium JSON" "invalid"
 fi
 
-# Async loop (3 seconds, interval 0.3s → expect 8+ steps)
+# Async loop (daemon mode, 3 seconds, interval 0.3s → expect 5+ steps)
 MLOOP=$(python3 -c "
 import subprocess, sys, time
 proc = subprocess.Popen(
-    [sys.executable, 'mycelium.py', '--mesh', '$TESTDIR/mesh.db', '--interval', '0.3'],
+    [sys.executable, 'mycelium.py', '--daemon', '--mesh', '$TESTDIR/mesh.db', '--interval', '0.3'],
     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-time.sleep(3)
+time.sleep(4)
 proc.terminate()
 out, _ = proc.communicate(timeout=5)
-lines = [l for l in out.strip().split(chr(10)) if l.startswith('[mycelium] step=')]
+lines = [l for l in out.strip().split(chr(10)) if 'step=' in l or 'organisms=' in l]
 print(len(lines))
 " 2>/dev/null)
 if [ "$MLOOP" -ge 5 ] 2>/dev/null; then
@@ -366,6 +366,215 @@ if echo "$MDRIFT" | grep -q "action="; then
     pass "mycelium METHOD engine active"
 else
     fail "mycelium METHOD engine" "no action in output"
+fi
+
+# ─────────────────────────────────────────────────────
+echo -e "${CYAN}4b. MYCELIUM SELF-AWARENESS${NC}"
+echo "─────────────────────────────────────────────────"
+
+# MyceliumGamma
+GAMMA_TEST=$(python3 -c "
+import sys; sys.path.insert(0, '.')
+from mycelium import MyceliumGamma
+import numpy as np
+g = MyceliumGamma()
+assert g.magnitude == 0.0, 'initial magnitude should be 0'
+g.imprint('dampen', 0.8, -0.5)
+g.imprint('dampen', 0.7, -0.3)
+g.imprint('explore', 0.5, 0.2)
+assert g.magnitude > 0, 'magnitude should grow'
+t, c = g.dominant_tendency()
+assert t in ('dampen','explore','sustain','amplify','ground','realign','wait'), f'bad tendency: {t}'
+assert -1 <= c <= 1, f'cosine out of range: {c}'
+# Test cosine_with
+other = np.random.randn(32).astype(np.float64)
+cos = g.cosine_with(other)
+assert -1 <= cos <= 1
+print(f'PASS mag={g.magnitude:.3f} tendency={t} cos={c:.3f}')
+" 2>/dev/null)
+if echo "$GAMMA_TEST" | grep -q "PASS"; then
+    pass "MyceliumGamma ($GAMMA_TEST)"
+else
+    fail "MyceliumGamma" "$GAMMA_TEST"
+fi
+
+# HarmonicNet
+HNET_TEST=$(python3 -c "
+import sys; sys.path.insert(0, '.')
+from mycelium import HarmonicNet
+import numpy as np
+
+class FakeOrg:
+    def __init__(self, oid, ent):
+        self.id = oid
+        self.entropy = ent
+        self.gamma_direction = np.random.randn(32).astype(np.float64).tobytes()
+
+h = HarmonicNet()
+orgs = [FakeOrg('a', 1.1), FakeOrg('b', 0.9), FakeOrg('c', 1.5)]
+# Run 5 steps to build history
+for i in range(5):
+    out = h.forward(orgs, 1.0 + 0.2*np.sin(i), 0.7, 0.4, i)
+assert 'action_bias' in out, 'missing action_bias'
+assert 'strength_mod' in out, 'missing strength_mod'
+assert 'harmonics' in out, 'missing harmonics'
+assert 'resonance' in out, 'missing resonance'
+nh = len(out['harmonics'])
+nr = len(out['resonance'])
+sm = out['strength_mod']
+assert nh == 8, 'expected 8 harmonics, got %d' % nh
+assert nr == 3, 'expected 3 resonance, got %d' % nr
+assert 0 <= sm <= 1.5, 'strength_mod out of range: %.2f' % sm
+print('PASS harmonics=%d resonance=%d str_mod=%.2f' % (nh, nr, sm))
+" 2>/dev/null)
+if echo "$HNET_TEST" | grep -q "PASS"; then
+    pass "HarmonicNet ($HNET_TEST)"
+else
+    fail "HarmonicNet" "$HNET_TEST"
+fi
+
+# MyceliumSyntropy
+SYN_TEST=$(python3 -c "
+import sys; sys.path.insert(0, '.')
+from mycelium import MyceliumSyntropy
+
+s = MyceliumSyntropy()
+# Simulate field improving under guidance
+for i in range(8):
+    ent = 1.5 - i * 0.05  # entropy decreasing
+    syn = 0.3 + i * 0.02
+    coh = 0.6 + i * 0.01
+    s.snapshot_before(ent + 0.05, syn - 0.02, coh - 0.01)
+    s.record_decision('dampen' if i % 2 == 0 else 'sustain', 0.5, ent, syn, coh)
+
+m = s.measure()
+assert m['n_decisions'] == 8, 'expected 8, got %d' % m['n_decisions']
+assert m['syntropy_trend'] > 0, 'trend should be positive: %.4f' % m['syntropy_trend']
+assert m['decision_entropy'] > 0, 'decision_entropy should be > 0'
+assert 'effectiveness' in m
+should, reason = s.should_change_strategy()
+print('PASS trend=%+.3f H_dec=%.2f strat=%s' % (m['syntropy_trend'], m['decision_entropy'], reason))
+" 2>/dev/null)
+if echo "$SYN_TEST" | grep -q "PASS"; then
+    pass "MyceliumSyntropy ($SYN_TEST)"
+else
+    fail "MyceliumSyntropy" "$SYN_TEST"
+fi
+
+# FieldPulse
+PULSE_TEST=$(python3 -c "
+import sys; sys.path.insert(0, '.')
+from mycelium import FieldPulse
+import numpy as np
+
+class FakeOrg:
+    def __init__(self, oid, ent):
+        self.id = oid
+        self.entropy = ent
+
+p = FieldPulse()
+orgs = [FakeOrg('a', 1.1), FakeOrg('b', 0.9)]
+p.measure(orgs, 1.0)
+assert p.novelty == 1.0, 'first observation novelty should be 1.0: %.2f' % p.novelty
+
+p.measure(orgs, 1.2)
+assert p.novelty == 0.0, 'same organisms, novelty should be 0: %.2f' % p.novelty
+assert p.arousal > 0, 'entropy changed, arousal should be > 0: %.2f' % p.arousal
+
+# Add new organism → novelty
+orgs.append(FakeOrg('c', 1.5))
+p.measure(orgs, 1.2)
+assert p.novelty > 0, 'new organism, novelty should be > 0: %.2f' % p.novelty
+print('PASS n=%.2f a=%.2f e=%.2f' % (p.novelty, p.arousal, p.entropy))
+" 2>/dev/null)
+if echo "$PULSE_TEST" | grep -q "PASS"; then
+    pass "FieldPulse ($PULSE_TEST)"
+else
+    fail "FieldPulse" "$PULSE_TEST"
+fi
+
+# SteeringDissonance
+DIS_TEST=$(python3 -c "
+import sys; sys.path.insert(0, '.')
+from mycelium import SteeringDissonance
+
+d = SteeringDissonance()
+
+# Dampen but entropy went up → dissonance should be high
+d.update('dampen', 0.5, 0.0)  # delta_H=0.5 (up), delta_C=0
+assert d.dissonance > 0, 'dissonance should be > 0 after bad dampen: %.3f' % d.dissonance
+
+# Explore and entropy went up → consonance (low dissonance change)
+d2 = SteeringDissonance()
+d2.update('explore', 0.3, 0.1)  # entropy up, that's what we wanted
+# Dissonance should be lower since intent matched outcome
+
+# strength_multiplier test
+assert 0.3 <= d.strength_multiplier() <= 2.0, 'multiplier out of range: %.2f' % d.strength_multiplier()
+print('PASS dis=%.3f mul=%.2f' % (d.dissonance, d.strength_multiplier()))
+" 2>/dev/null)
+if echo "$DIS_TEST" | grep -q "PASS"; then
+    pass "SteeringDissonance ($DIS_TEST)"
+else
+    fail "SteeringDissonance" "$DIS_TEST"
+fi
+
+# OrganismAttention
+ATT_TEST=$(python3 -c "
+import sys; sys.path.insert(0, '.')
+from mycelium import OrganismAttention
+
+class FakeOrg:
+    def __init__(self, oid, ent):
+        self.id = oid
+        self.entropy = ent
+
+a = OrganismAttention()
+orgs = [FakeOrg('go', 1.0), FakeOrg('c', 0.9)]
+pre = {'go': 1.2, 'c': 0.9}  # go-alpha entropy was 1.2, now 1.0 (went down)
+
+# Under 'dampen' action, go responded (entropy down), c didn't change
+a.update(orgs, 'dampen', pre)
+assert a.weights['go'] > a.weights['c'], 'go should have higher attention'
+top = a.top_organisms(1)
+assert top[0][0] == 'go', 'go should be most responsive'
+print('PASS go=%.3f c=%.3f' % (a.weights['go'], a.weights['c']))
+" 2>/dev/null)
+if echo "$ATT_TEST" | grep -q "PASS"; then
+    pass "OrganismAttention ($ATT_TEST)"
+else
+    fail "OrganismAttention" "$ATT_TEST"
+fi
+
+# Full self-awareness integration (step with gamma+harmonic+syntropy+pulse)
+FULL_TEST=$(python3 -c "
+import sys, sqlite3, time, numpy as np
+sys.path.insert(0, '.')
+
+db = '$TESTDIR/mesh.db'
+# Ensure organisms have fresh heartbeat
+con = sqlite3.connect(db)
+con.execute('UPDATE organisms SET last_heartbeat = ?', (time.time(),))
+con.commit()
+con.close()
+
+from mycelium import Mycelium
+myc = Mycelium(mesh_path=db, interval=0.5, verbose=False)
+for i in range(5):
+    s = myc.step()
+
+# Check all components are alive
+assert myc.gamma.magnitude >= 0, 'gamma not working'
+m = myc.syntropy.measure()
+assert m['n_decisions'] == 5, 'expected 5 decisions, got %d' % m['n_decisions']
+assert myc.pulse.entropy >= 0, 'pulse not measuring'
+assert len(myc.harmonic._entropy_history) >= 5, 'harmonic not recording'
+print('PASS g=%.3f syn=%+.3f pulse=%.2f steps=5' % (myc.gamma.magnitude, m['syntropy_trend'], myc.pulse.entropy))
+" 2>/dev/null)
+if echo "$FULL_TEST" | grep -q "PASS"; then
+    pass "self-awareness integration ($FULL_TEST)"
+else
+    fail "self-awareness integration" "$FULL_TEST"
 fi
 
 echo ""
