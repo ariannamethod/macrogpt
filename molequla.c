@@ -2262,6 +2262,10 @@ static int gpt_maybe_grow_architecture(GPT *g, int corpus_chars) {
 
     /* 4. Grow delta adapters */
     int r = CFG.delta_rank;
+    /* Save old adapter counts before dmod_set increases them */
+    int old_adapter_counts[MAX_DELTA_MODS];
+    for (int d = 0; d < g->n_deltas; d++)
+        old_adapter_counts[d] = g->deltas[d]->count;
     for (int d = 0; d < g->n_deltas; d++) {
         DeltaModule *mod = g->deltas[d];
         /* Grow existing layer adapters */
@@ -2324,11 +2328,28 @@ static int gpt_maybe_grow_architecture(GPT *g, int corpus_chars) {
         DeltaAdapter *da_lm = dmod_get(mod, "lm_head");
         if (da_lm) delta_grow_dims(da_lm, g->tok->vocab_size, new_embd);
 
-        /* Rebuild Adam states for this delta module (all stale now) */
-        for (int a = 0; a < mod->count; a++) {
-            DeltaAdapter *da2 = mod->adapters[a];
-            adam_reset(g->delta_adam[d][a*2],   da2->A->nout, da2->A->nin);
-            adam_reset(g->delta_adam[d][a*2+1], da2->B->nout, da2->B->nin);
+        /* Rebuild Adam states: growth may have added adapters via dmod_set,
+         * so mod->count > old_adapter_counts[d] and the old delta_adam array
+         * is too small. Realloc and create new entries, then reset all. */
+        {
+            int old_cnt = old_adapter_counts[d];
+            if (mod->count > old_cnt) {
+                /* Realloc to hold new adapter adam states */
+                g->delta_adam[d] = realloc(g->delta_adam[d],
+                                           sizeof(AdamState*) * mod->count * 2);
+                /* Create adam states for newly added adapters */
+                for (int a = old_cnt; a < mod->count; a++) {
+                    DeltaAdapter *da2 = mod->adapters[a];
+                    g->delta_adam[d][a*2]   = adam_new(da2->A->nout, da2->A->nin);
+                    g->delta_adam[d][a*2+1] = adam_new(da2->B->nout, da2->B->nin);
+                }
+            }
+            /* Reset all adam states (old momentum is meaningless after arch change) */
+            for (int a = 0; a < mod->count; a++) {
+                DeltaAdapter *da2 = mod->adapters[a];
+                adam_reset(g->delta_adam[d][a*2],   da2->A->nout, da2->A->nin);
+                adam_reset(g->delta_adam[d][a*2+1], da2->B->nout, da2->B->nin);
+            }
         }
     }
 
