@@ -36,6 +36,7 @@ from pathlib import Path
 # Add parent dir so ariannamethod is importable
 sys.path.insert(0, str(Path(__file__).parent))
 
+import numpy as np
 from ariannamethod import Method
 
 
@@ -222,6 +223,586 @@ class MyceliumVoice:
         return "\n".join(lines)
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# field pulse — inspired by harmonix/haiku (ariannamethod/harmonix)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FieldPulse:
+    """
+    Pulse of the field. Borrowed from harmonix/haiku PulseSnapshot.
+
+    Three dimensions:
+        novelty  — new organisms? topology changed?
+        arousal  — how fast is entropy changing? (|ΔH|)
+        entropy  — diversity of organism states (Shannon over individual entropies)
+
+    The pulse modulates how strongly mycelium intervenes:
+    high arousal + high novelty → be careful, field is volatile
+    low arousal + low novelty → field is sleeping, maybe explore
+    """
+
+    def __init__(self):
+        self.novelty = 0.0
+        self.arousal = 0.0
+        self.entropy = 0.0
+        self._prev_organism_ids = set()
+        self._prev_field_entropy = None
+
+    def measure(self, organisms, field_entropy):
+        """compute pulse from current field state."""
+        # Novelty: did organisms appear or disappear?
+        current_ids = set(o.id for o in organisms)
+        if self._prev_organism_ids:
+            new_orgs = current_ids - self._prev_organism_ids
+            lost_orgs = self._prev_organism_ids - current_ids
+            self.novelty = (len(new_orgs) + len(lost_orgs)) / max(1, len(current_ids))
+        else:
+            self.novelty = 1.0 if organisms else 0.0  # first observation = fully novel
+        self._prev_organism_ids = current_ids
+
+        # Arousal: rate of entropy change
+        if self._prev_field_entropy is not None:
+            self.arousal = min(1.0, abs(field_entropy - self._prev_field_entropy) * 2)
+        else:
+            self.arousal = 0.0
+        self._prev_field_entropy = field_entropy
+
+        # Entropy: diversity of organism states (Shannon)
+        if len(organisms) >= 2:
+            entropies = np.array([o.entropy for o in organisms])
+            # Normalize to probabilities
+            total = np.sum(entropies) + 1e-10
+            probs = entropies / total
+            self.entropy = float(-np.sum(probs * np.log(probs + 1e-10)))
+        elif organisms:
+            self.entropy = 0.0
+        else:
+            self.entropy = 0.0
+
+        return self
+
+    def as_dict(self):
+        return {"novelty": round(self.novelty, 4),
+                "arousal": round(self.arousal, 4),
+                "entropy": round(self.entropy, 4)}
+
+
+class SteeringDissonance:
+    """
+    Dissonance between intent and outcome. From harmonix principle:
+    dissonance = mismatch between what mycelium wanted and what happened.
+
+    If I said DAMPEN and entropy went UP → dissonance is high → increase strength.
+    If I said EXPLORE and entropy went UP → consonance → maintain.
+
+    Temperature-like: high dissonance → stronger intervention next time.
+    Low dissonance → gentler touch.
+    """
+
+    # Expected effect per action (positive = entropy should go up)
+    EXPECTED_EFFECT = {
+        "dampen":  -1,  # entropy should decrease
+        "ground":  -1,
+        "amplify": +1,  # entropy should increase
+        "explore": +1,
+        "realign":  0,  # coherence should increase, entropy neutral
+        "sustain":  0,
+        "wait":     0,
+    }
+
+    def __init__(self, decay=0.9):
+        self.decay = decay
+        self.dissonance = 0.0  # EMA of recent dissonance
+        self.history = []      # last 16 (action, expected, actual)
+
+    def update(self, action, delta_entropy, delta_coherence):
+        """
+        Compute dissonance for this step.
+        Returns dissonance value [0, 1].
+        """
+        expected_dir = self.EXPECTED_EFFECT.get(action, 0)
+
+        if expected_dir == 0:
+            # Neutral action — dissonance from absolute change
+            raw = min(1.0, abs(delta_entropy) * 2)
+        elif expected_dir > 0:
+            # Wanted entropy up — dissonance if it went down
+            raw = max(0, -delta_entropy) * 2
+        else:
+            # Wanted entropy down — dissonance if it went up
+            raw = max(0, delta_entropy) * 2
+
+        raw = min(1.0, raw)
+
+        # EMA smoothing (like harmonix dissonance_ema)
+        self.dissonance = self.decay * self.dissonance + (1 - self.decay) * raw
+
+        self.history.append({"action": action, "raw": raw, "ema": self.dissonance})
+        if len(self.history) > 16:
+            self.history = self.history[-16:]
+
+        return self.dissonance
+
+    def strength_multiplier(self):
+        """
+        How much to scale steering strength based on dissonance.
+        Borrowed from harmonix: dissonance → temperature mapping.
+
+        Low dissonance (< 0.2) → gentle (0.5x)
+        Medium (0.2-0.5) → normal (1.0x)
+        High (> 0.5) → aggressive (1.5x)
+        """
+        if self.dissonance < 0.2:
+            return 0.5 + self.dissonance * 2.5  # 0.5 → 1.0
+        elif self.dissonance < 0.5:
+            return 1.0                           # 1.0
+        else:
+            return 1.0 + (self.dissonance - 0.5) # 1.0 → 1.5
+
+
+class OrganismAttention:
+    """
+    Organism attention map — which organisms respond to steering?
+    Inspired by harmonix cloud morphing: active words get boosted.
+
+    Organisms that respond to steering (entropy changes in expected direction)
+    get higher attention weight. Unresponsive organisms decay.
+
+    This lets mycelium focus on organisms that are "listening".
+    """
+
+    def __init__(self, boost=1.1, decay=0.99):
+        self.weights = {}  # organism_id → attention weight
+        self.boost = boost
+        self.decay = decay
+
+    def update(self, organisms, action, pre_entropies):
+        """
+        After steering, compare each organism's entropy change.
+        Responsive organisms get boosted.
+
+        pre_entropies: {org_id: entropy_before}
+        """
+        expected_dir = SteeringDissonance.EXPECTED_EFFECT.get(action, 0)
+
+        for o in organisms:
+            oid = o.id
+            if oid not in self.weights:
+                self.weights[oid] = 1.0
+
+            if oid in pre_entropies:
+                delta = o.entropy - pre_entropies[oid]
+                # Check if organism responded in expected direction
+                if expected_dir != 0:
+                    if (expected_dir > 0 and delta > 0) or (expected_dir < 0 and delta < 0):
+                        self.weights[oid] *= self.boost  # responsive
+                    else:
+                        self.weights[oid] *= self.decay   # unresponsive
+                else:
+                    self.weights[oid] *= self.decay
+
+            # Cap weights
+            self.weights[oid] = max(0.1, min(3.0, self.weights[oid]))
+
+        # Remove dead organisms
+        alive = set(o.id for o in organisms)
+        self.weights = {k: v for k, v in self.weights.items() if k in alive}
+
+    def top_organisms(self, n=3):
+        """most attentive organisms."""
+        return sorted(self.weights.items(), key=lambda x: -x[1])[:n]
+
+    def report(self):
+        if not self.weights:
+            return "no organisms tracked."
+        lines = []
+        for oid, w in sorted(self.weights.items(), key=lambda x: -x[1]):
+            bar = "#" * int(w * 10)
+            lines.append(f"  {oid}: {w:.3f} {bar}")
+        return "\n".join(lines)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# mycelium gamma — personality fingerprint, harmonically computed
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MyceliumGamma:
+    """
+    γ_myc — the mycelium's personality vector.
+
+    not learned. not backpropped. computed from the history of decisions.
+    each steering action imprints on gamma through harmonic basis functions.
+
+    low frequencies capture tendencies (always dampening? always exploring?).
+    high frequencies capture reactivity (how fast does strategy change?).
+
+    γ_myc ∈ R^32, same dimensionality as organism gammas.
+    can be compared via cosine similarity — "how aligned is mycelium with organism X?"
+    """
+
+    DIM = 32
+    N_HARMONICS = 8
+
+    def __init__(self):
+        self.gamma = np.zeros(self.DIM, dtype=np.float64)
+        self.magnitude = 0.0
+        self._step = 0
+
+        # fixed directions in gamma-space — one per action type
+        # deterministic seed so gamma is reproducible across restarts
+        rng = np.random.RandomState(42)
+        self._action_dirs = {}
+        for action in ["amplify", "dampen", "ground", "explore", "realign", "sustain", "wait"]:
+            v = rng.randn(self.DIM).astype(np.float64)
+            v /= np.linalg.norm(v)
+            self._action_dirs[action] = v
+
+    def imprint(self, action, strength, effect):
+        """
+        a decision happened. imprint it on gamma.
+
+        action:   what was decided (dampen, explore, etc.)
+        strength: how strong (0-1)
+        effect:   field_entropy_after - field_entropy_before
+
+        harmonic weighting: low frequencies persist, high frequencies decay.
+        this creates a gamma that encodes both long-term style and recent behavior.
+        """
+        self._step += 1
+        t = self._step
+        direction = self._action_dirs.get(action, np.zeros(self.DIM))
+
+        # harmonic weight — superposition of frequencies
+        weight = 0.0
+        for k in range(1, self.N_HARMONICS + 1):
+            decay = np.exp(-0.01 * k)  # higher freq decays faster per step
+            weight += np.cos(2 * np.pi * k * t / 64.0) * decay / k
+
+        scale = strength * (1.0 + abs(effect)) * weight
+        self.gamma += scale * direction
+
+        # let magnitude grow (it's meaningful — how much personality has formed)
+        # but cap to prevent explosion
+        mag = np.linalg.norm(self.gamma)
+        if mag > 1e-8:
+            self.magnitude = float(mag)
+            if mag > 10.0:
+                self.gamma *= 10.0 / mag
+                self.magnitude = 10.0
+
+    def cosine_with(self, other_gamma):
+        """cosine similarity with an organism's gamma vector."""
+        if self.magnitude < 1e-8:
+            return 0.0
+        other = np.asarray(other_gamma, dtype=np.float64)
+        other_mag = np.linalg.norm(other)
+        if other_mag < 1e-8:
+            return 0.0
+        dim = min(len(self.gamma), len(other))
+        return float(np.dot(self.gamma[:dim], other[:dim]) / (self.magnitude * other_mag))
+
+    def direction(self):
+        """unit vector, or zero if no personality yet."""
+        if self.magnitude < 1e-8:
+            return np.zeros(self.DIM)
+        return self.gamma / self.magnitude
+
+    def as_blob(self):
+        """serialize for mesh.db."""
+        return self.gamma.tobytes()
+
+    def dominant_tendency(self):
+        """which action direction is gamma most aligned with?"""
+        if self.magnitude < 1e-8:
+            return "none", 0.0
+        best_action, best_cos = "none", -1.0
+        d = self.direction()
+        for action, v in self._action_dirs.items():
+            cos = float(np.dot(d, v))
+            if cos > best_cos:
+                best_cos = cos
+                best_action = action
+        return best_action, best_cos
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# harmonic net — weightless neural network
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class HarmonicNet:
+    """
+    Weightless harmonic network. The neural network that has no weights.
+
+    Architecture (3 layers, all computed from data):
+        Layer 1: harmonic embedding — decompose entropy history into frequencies
+        Layer 2: correlation matrix — pairwise gamma cosines between organisms
+        Layer 3: phase aggregation — combine resonance + harmonics into steering
+
+    "Weights" = organism correlations. They change every step.
+    No backprop. No gradients. No training. Just resonance.
+
+    Input:  field state (organisms, entropy, coherence, syntropy)
+    Output: action_bias (per-action scores), strength_mod (confidence)
+    """
+
+    N_HARMONICS = 8
+
+    def __init__(self, dim=32):
+        self.dim = dim
+        self._entropy_history = []
+        self._max_history = 64
+        self._last_harmonics = np.zeros(self.N_HARMONICS)
+        self._last_resonance = []
+
+    def forward(self, organisms, field_entropy, field_coherence, field_syntropy, step):
+        """
+        One forward pass. No backprop ever.
+
+        Returns dict:
+            action_bias: {action_name: score} — suggested emphasis
+            strength_mod: 0-1 — confidence multiplier
+            harmonics: frequency decomposition of entropy history
+            resonance: per-organism resonance scores
+            dominant_freq: which harmonic dominates
+        """
+        if not organisms:
+            return {"action_bias": {}, "strength_mod": 0.0,
+                    "harmonics": [], "resonance": [], "dominant_freq": 0}
+
+        self._entropy_history.append(field_entropy)
+        if len(self._entropy_history) > self._max_history:
+            self._entropy_history = self._entropy_history[-self._max_history:]
+
+        # ── Layer 1: Harmonic embedding ──
+        # Fourier decomposition of entropy history
+        harmonics = np.zeros(self.N_HARMONICS)
+        T = len(self._entropy_history)
+        if T >= 4:
+            signal = np.array(self._entropy_history)
+            for k in range(self.N_HARMONICS):
+                t = np.arange(T, dtype=np.float64)
+                harmonics[k] = np.sum(signal * np.sin(2 * np.pi * (k + 1) * t / T)) / T
+        self._last_harmonics = harmonics
+
+        # ── Layer 2: Correlation matrix ──
+        # Pairwise gamma cosines — the "weight matrix"
+        n = len(organisms)
+        gammas = []
+        for o in organisms:
+            if o.gamma_direction and len(o.gamma_direction) >= self.dim * 8:
+                g = np.frombuffer(o.gamma_direction[:self.dim * 8], dtype=np.float64)
+                gammas.append(g[:self.dim] if len(g) >= self.dim else np.pad(g, (0, self.dim - len(g))))
+            else:
+                gammas.append(np.zeros(self.dim))
+        gammas = np.array(gammas)
+
+        norms = np.linalg.norm(gammas, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)
+        normed = gammas / norms
+        corr = normed @ normed.T  # n×n correlation matrix
+
+        # ── Layer 3: Phase aggregation ──
+        # Each organism's "phase" = entropy relative to field mean
+        entropies = np.array([o.entropy for o in organisms])
+        mean_ent = np.mean(entropies) if len(entropies) > 0 else 1.0
+        phases = entropies - mean_ent
+
+        # Resonance: organisms that correlate AND have similar phase
+        resonance = np.zeros(n)
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    resonance[i] += corr[i, j] * np.exp(-abs(phases[i] - phases[j]))
+            if n > 1:
+                resonance[i] /= (n - 1)
+        self._last_resonance = resonance.tolist()
+
+        # ── Output: action biases from harmonic + resonance analysis ──
+        action_bias = {}
+        dominant_freq = int(np.argmax(np.abs(harmonics))) if T >= 4 else 0
+        dominant_amp = float(harmonics[dominant_freq]) if T >= 4 else 0.0
+
+        # Slow trend (low frequency dominant)
+        if dominant_freq <= 1:
+            if dominant_amp > 0.1:
+                action_bias["dampen"] = min(dominant_amp * 2, 1.0)
+            elif dominant_amp < -0.1:
+                action_bias["amplify"] = min(abs(dominant_amp) * 2, 1.0)
+
+        # Fast oscillation (high frequency) → ground
+        elif dominant_freq >= 4:
+            action_bias["ground"] = min(abs(float(harmonics[dominant_freq])) * 3, 1.0)
+
+        # Low resonance → organisms aren't talking → explore
+        mean_res = float(np.mean(resonance)) if len(resonance) > 0 else 0.0
+        if mean_res < 0.3:
+            action_bias["explore"] = max(action_bias.get("explore", 0), 0.5)
+
+        # High resonance variance → some connected, some not → realign
+        if n > 1:
+            res_var = float(np.var(resonance))
+            if res_var > 0.1:
+                action_bias["realign"] = min(res_var * 3, 1.0)
+
+        # Strength modulation: more data = more confident
+        confidence = min(1.0, T / 16.0) * min(1.0, n / 4.0)
+        strength_mod = 0.3 + 0.7 * confidence
+
+        return {
+            "action_bias": action_bias,
+            "strength_mod": float(strength_mod),
+            "harmonics": harmonics.tolist(),
+            "resonance": resonance.tolist(),
+            "dominant_freq": dominant_freq,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# mycelium syntropy — mathematical self-awareness of the orchestrator
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MyceliumSyntropy:
+    """
+    SyntropyTracker for mycelium.
+
+    An organism's SyntropyTracker asks: "am I learning?"
+    Mycelium's asks: "am I helping?"
+
+    Tracks:
+    - decision effectiveness: did my steering improve the field?
+    - decision entropy: am I stuck in a pattern? (low = repetitive, high = random)
+    - syntropy trend: is the field organizing under my guidance?
+    - purpose magnitude: how strong is my steering direction?
+    - purpose alignment: am I consistent? (low variance = aligned)
+    """
+
+    def __init__(self, window=16):
+        self.window = window
+        self.decision_history = []    # [{action, strength, delta_h, delta_s, delta_c, ...}]
+        self.entropy_history = []     # field entropy over time
+        self.syntropy_trend = 0.0     # positive = field organizing under my guidance
+        self.decision_entropy = 0.0   # diversity of my decisions
+        self.purpose_magnitude = 0.0  # how strongly am I steering
+        self.purpose_alignment = 0.0  # how consistently
+        self.effectiveness = {}       # action → mean improvement score
+        self.last_action = "none"
+        self._last_field = None       # snapshot before decision
+
+    def snapshot_before(self, field_entropy, field_syntropy, field_coherence):
+        """snapshot before making a decision — so we can measure effect."""
+        self._last_field = {
+            "entropy": field_entropy,
+            "syntropy": field_syntropy,
+            "coherence": field_coherence,
+        }
+
+    def record_decision(self, action, strength, field_entropy, field_syntropy, field_coherence):
+        """record decision outcome — what happened to the field after my action?"""
+        before = self._last_field or {
+            "entropy": field_entropy,
+            "syntropy": field_syntropy,
+            "coherence": field_coherence,
+        }
+
+        record = {
+            "action": action,
+            "strength": strength,
+            "delta_h": field_entropy - before["entropy"],
+            "delta_s": field_syntropy - before["syntropy"],
+            "delta_c": field_coherence - before["coherence"],
+            "field_h": field_entropy,
+            "field_s": field_syntropy,
+            "field_c": field_coherence,
+        }
+        self.decision_history.append(record)
+        if len(self.decision_history) > 64:
+            self.decision_history = self.decision_history[-64:]
+
+        self.entropy_history.append(field_entropy)
+        if len(self.entropy_history) > 64:
+            self.entropy_history = self.entropy_history[-64:]
+
+        self.last_action = action
+        self._last_field = {
+            "entropy": field_entropy,
+            "syntropy": field_syntropy,
+            "coherence": field_coherence,
+        }
+        self._recompute()
+
+    def _recompute(self):
+        """recompute all syntropy metrics."""
+        # 1. Syntropy trend: field entropy trending down = organizing
+        if len(self.entropy_history) >= 4:
+            half = len(self.entropy_history) // 2
+            old_mean = float(np.mean(self.entropy_history[:half]))
+            new_mean = float(np.mean(self.entropy_history[half:]))
+            self.syntropy_trend = old_mean - new_mean
+
+        # 2. Decision entropy: diversity of recent actions
+        if len(self.decision_history) >= 4:
+            recent = self.decision_history[-min(self.window, len(self.decision_history)):]
+            counts = {}
+            for d in recent:
+                a = d["action"]
+                counts[a] = counts.get(a, 0) + 1
+            total = sum(counts.values())
+            probs = [c / total for c in counts.values()]
+            self.decision_entropy = float(-sum(p * np.log(p + 1e-10) for p in probs))
+
+        # 3. Per-action effectiveness
+        eff_raw = {}
+        for d in self.decision_history:
+            a = d["action"]
+            if a not in eff_raw:
+                eff_raw[a] = []
+            score = d["delta_s"] + d["delta_c"] * 0.5
+            eff_raw[a].append(score)
+        self.effectiveness = {}
+        for a, vals in eff_raw.items():
+            self.effectiveness[a] = float(np.mean(vals[-self.window:]))
+
+        # 4. Purpose: how strongly and consistently am I steering
+        if len(self.decision_history) >= 2:
+            deltas = [d["delta_s"] for d in self.decision_history[-self.window:]]
+            self.purpose_magnitude = float(abs(np.mean(deltas)))
+            self.purpose_alignment = float(1.0 / (1.0 + np.std(deltas))) if len(deltas) >= 2 else 0.0
+
+    def measure(self):
+        """current metrics as dict."""
+        return {
+            "syntropy_trend": round(self.syntropy_trend, 4),
+            "decision_entropy": round(self.decision_entropy, 4),
+            "purpose_magnitude": round(self.purpose_magnitude, 4),
+            "purpose_alignment": round(self.purpose_alignment, 4),
+            "effectiveness": {k: round(v, 4) for k, v in self.effectiveness.items()},
+            "last_action": self.last_action,
+            "n_decisions": len(self.decision_history),
+        }
+
+    def should_change_strategy(self):
+        """am I stuck or failing? should I try something different?"""
+        if len(self.decision_history) < 8:
+            return False, "too early"
+
+        if self.decision_entropy < 0.5:
+            return True, f"stuck in pattern (H_dec={self.decision_entropy:.2f})"
+
+        if self.syntropy_trend < -0.05 and len(self.entropy_history) >= 8:
+            return True, f"field dissolving under guidance (trend={self.syntropy_trend:.3f})"
+
+        return False, "on track"
+
+    def status_line(self):
+        """one-line self-report."""
+        m = self.measure()
+        return (f"syntropy_trend={m['syntropy_trend']:+.3f} "
+                f"H_dec={m['decision_entropy']:.2f} "
+                f"purpose={m['purpose_magnitude']:.3f}×{m['purpose_alignment']:.2f} "
+                f"n={m['n_decisions']}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # mycelium core
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -236,17 +817,97 @@ class Mycelium:
         self.monitor = FieldMonitor()
         self.drift = DriftTracker()
         self.voice = MyceliumVoice()
+        self.gamma = MyceliumGamma()
+        self.harmonic = HarmonicNet()
+        self.syntropy = MyceliumSyntropy()
+        self.pulse = FieldPulse()
+        self.dissonance = SteeringDissonance()
+        self.attention = OrganismAttention()
         self.running = False
         self._step_count = 0
         self._last_steering = None
 
     def step(self):
-        """one tick: read field -> METHOD -> monitor -> write steering -> report."""
+        """one tick: snapshot → METHOD → harmonic → gamma → syntropy → steer."""
+        # 1. Snapshot field state BEFORE decision
+        self.method.read_field()
+        pre_h = self.method.field_entropy()
+        pre_s = self.method.field_syntropy()
+        pre_c = self.method.field_coherence()
+        self.syntropy.snapshot_before(pre_h, pre_s, pre_c)
+
+        # 2. METHOD computes raw steering (C-native, BLAS)
         steering = self.method.step(dt=self.interval)
+
+        # 2b. Measure field pulse (harmonix-inspired)
+        self.pulse.measure(self.method.organisms, pre_h)
+
+        # 2c. Pre-steering organism entropies (for attention tracking)
+        pre_entropies = {o.id: o.entropy for o in self.method.organisms}
+
+        # 3. HarmonicNet refines — looks at deeper patterns
+        h_out = self.harmonic.forward(
+            self.method.organisms,
+            steering.get("entropy", 0),
+            steering.get("coherence", 1),
+            steering.get("syntropy", 0),
+            self._step_count,
+        )
+
+        # Apply harmonic refinement to strength
+        if h_out["strength_mod"] > 0:
+            base_strength = steering.get("strength", 0.5)
+            steering["strength"] = base_strength * h_out["strength_mod"]
+
+        # If harmonic net suggests a different action strongly, note it
+        if h_out["action_bias"]:
+            best_harmonic = max(h_out["action_bias"], key=h_out["action_bias"].get)
+            steering["harmonic_suggestion"] = best_harmonic
+            steering["harmonic_confidence"] = h_out["action_bias"][best_harmonic]
+
+        # 3b. Dissonance modulation (harmonix principle: intent vs outcome)
+        post_h = steering.get("entropy", pre_h)
+        post_s = steering.get("syntropy", pre_s)
+        post_c = steering.get("coherence", pre_c)
+        action = steering.get("action", "wait")
+        dis = self.dissonance.update(action, post_h - pre_h, post_c - pre_c)
+        steering["strength"] = min(1.0,
+            steering.get("strength", 0.5) * self.dissonance.strength_multiplier())
+
+        # 4. Write steering to mesh.db for Rust
         self.method.write_steering(steering)
+
+        # 4b. Update organism attention (harmonix cloud morphing)
+        self.attention.update(self.method.organisms, action=steering.get("action", "wait"),
+                              pre_entropies=pre_entropies)
+
+        # 5. Record decision in syntropy tracker
+        strength = steering.get("strength", 0)
+        self.syntropy.record_decision(action, strength, post_h, post_s, post_c)
+
+        # 6. Imprint on gamma
+        effect = post_h - pre_h
+        self.gamma.imprint(action, strength, effect)
+
+        # 7. Monitor + bookkeeping
         self.monitor.record(steering)
         self._step_count += 1
         self._last_steering = steering
+
+        # Add self-awareness to steering dict
+        steering["gamma_magnitude"] = self.gamma.magnitude
+        tendency, tendency_cos = self.gamma.dominant_tendency()
+        steering["gamma_tendency"] = tendency
+        steering["syntropy_trend"] = self.syntropy.syntropy_trend
+        steering["decision_entropy"] = self.syntropy.decision_entropy
+        steering["dissonance"] = self.dissonance.dissonance
+        steering["pulse_novelty"] = self.pulse.novelty
+        steering["pulse_arousal"] = self.pulse.arousal
+
+        # Check if we should change strategy
+        should_change, reason = self.syntropy.should_change_strategy()
+        if should_change:
+            steering["strategy_warning"] = reason
 
         # Check for drifters every 4 steps
         drift_report = None
@@ -255,7 +916,22 @@ class Mycelium:
             drift_report = self.drift.report()
 
         if self.verbose:
-            print(self.monitor.status_line(steering))
+            status = self.monitor.status_line(steering)
+            # Append gamma info
+            if self.gamma.magnitude > 0.01:
+                status += f" γ={self.gamma.magnitude:.2f}({tendency})"
+            # Pulse + dissonance
+            p = self.pulse
+            if p.arousal > 0.01 or p.novelty > 0.01:
+                status += f" pulse(n={p.novelty:.1f},a={p.arousal:.1f},e={p.entropy:.1f})"
+            if self.dissonance.dissonance > 0.01:
+                status += f" d={self.dissonance.dissonance:.2f}"
+            # Append syntropy self-check
+            if self.syntropy.syntropy_trend != 0:
+                status += f" Σ={self.syntropy.syntropy_trend:+.3f}"
+            if should_change:
+                status += f"  ⚠ {reason}"
+            print(status)
             if drift_report:
                 print(drift_report)
 
@@ -325,6 +1001,98 @@ class Mycelium:
         coh = self.method.field_coherence()
         return f"field coherence: {coh:.4f}"
 
+    def cmd_gamma(self):
+        """mycelium's personality vector."""
+        lines = [f"γ_myc magnitude: {self.gamma.magnitude:.4f}"]
+        tendency, cos = self.gamma.dominant_tendency()
+        lines.append(f"dominant tendency: {tendency} (cos={cos:.3f})")
+
+        # Compare with each organism's gamma
+        self.method.read_field()
+        if self.method.organisms:
+            lines.append("alignment with organisms:")
+            for o in self.method.organisms:
+                if o.gamma_direction and len(o.gamma_direction) >= 8:
+                    g = np.frombuffer(o.gamma_direction[:self.gamma.DIM * 8], dtype=np.float64)
+                    cos_val = self.gamma.cosine_with(g)
+                    bar = "#" * int(abs(cos_val) * 20)
+                    sign = "+" if cos_val >= 0 else "-"
+                    lines.append(f"  {o.id}: {sign}{abs(cos_val):.3f} {bar}")
+
+        return "\n".join(lines)
+
+    def cmd_syntropy(self):
+        """mycelium's self-awareness report."""
+        m = self.syntropy.measure()
+        lines = [
+            f"syntropy trend: {m['syntropy_trend']:+.4f}"
+            + (" (organizing)" if m['syntropy_trend'] > 0.01 else
+               " (dissolving)" if m['syntropy_trend'] < -0.01 else " (stable)"),
+            f"decision entropy: {m['decision_entropy']:.4f}"
+            + (" (diverse)" if m['decision_entropy'] > 1.0 else
+               " (repetitive)" if m['decision_entropy'] < 0.5 else " (balanced)"),
+            f"purpose: magnitude={m['purpose_magnitude']:.4f} alignment={m['purpose_alignment']:.4f}",
+            f"decisions: {m['n_decisions']}",
+        ]
+        if m['effectiveness']:
+            lines.append("effectiveness per action:")
+            for a, score in sorted(m['effectiveness'].items(), key=lambda x: -x[1]):
+                bar = "#" * int(max(0, score) * 20)
+                lines.append(f"  {a}: {score:+.4f} {bar}")
+
+        should_change, reason = self.syntropy.should_change_strategy()
+        if should_change:
+            lines.append(f"⚠ strategy change needed: {reason}")
+        else:
+            lines.append(f"strategy: {reason}")
+
+        return "\n".join(lines)
+
+    def cmd_pulse(self):
+        """field pulse (harmonix-style)."""
+        p = self.pulse
+        lines = [
+            f"novelty:  {p.novelty:.4f}" + (" (new organisms!)" if p.novelty > 0.5 else ""),
+            f"arousal:  {p.arousal:.4f}" + (" (field is volatile)" if p.arousal > 0.5 else ""),
+            f"entropy:  {p.entropy:.4f}" + (" (diverse)" if p.entropy > 1.0 else " (uniform)" if p.entropy < 0.3 else ""),
+        ]
+        d = self.dissonance
+        lines.append(f"dissonance: {d.dissonance:.4f} → strength ×{d.strength_multiplier():.2f}")
+        if d.history:
+            lines.append("recent:")
+            for h in d.history[-5:]:
+                lines.append(f"  {h['action']}: raw={h['raw']:.3f} ema={h['ema']:.3f}")
+        return "\n".join(lines)
+
+    def cmd_attention(self):
+        """organism attention map."""
+        lines = ["organism attention (who responds to steering?):"]
+        lines.append(self.attention.report())
+        top = self.attention.top_organisms(3)
+        if top:
+            lines.append(f"most responsive: {', '.join(f'{oid}({w:.2f})' for oid, w in top)}")
+        return "\n".join(lines)
+
+    def cmd_harmonics(self):
+        """harmonic net state — frequency decomposition."""
+        h = self.harmonic._last_harmonics
+        lines = ["entropy harmonics (frequency decomposition):"]
+        for k in range(len(h)):
+            bar_len = int(abs(h[k]) * 40)
+            sign = "+" if h[k] >= 0 else "-"
+            bar = "#" * bar_len
+            lines.append(f"  f{k+1}: {sign}{abs(h[k]):.4f} {bar}")
+
+        if self.harmonic._last_resonance:
+            lines.append("organism resonance:")
+            orgs = self.method.organisms if self.method.organisms else []
+            for i, r in enumerate(self.harmonic._last_resonance):
+                name = orgs[i].id if i < len(orgs) else f"org-{i}"
+                bar = "#" * int(abs(r) * 20)
+                lines.append(f"  {name}: {r:.3f} {bar}")
+
+        return "\n".join(lines)
+
     def cmd_help(self):
         return (
             "mycelium commands:\n"
@@ -334,6 +1102,11 @@ class Mycelium:
             "  /status    — one-line status\n"
             "  /entropy   — entropy per organism\n"
             "  /coherence — pairwise gamma coherence\n"
+            "  /gamma     — mycelium's personality vector\n"
+            "  /syntropy  — self-awareness: am I helping?\n"
+            "  /harmonics — frequency decomposition of field\n"
+            "  /pulse     — field pulse (novelty, arousal, entropy)\n"
+            "  /attention — organism attention map\n"
             "  /step      — force one METHOD step\n"
             "  /json      — last steering as JSON\n"
             "  /quit      — exit\n"
@@ -387,8 +1160,46 @@ class Mycelium:
                 try:
                     self.method.read_field()
                     if self.method.organisms:
+                        # Snapshot before
+                        pre_h = self.method.field_entropy()
+                        pre_s = self.method.field_syntropy()
+                        pre_c = self.method.field_coherence()
+                        self.syntropy.snapshot_before(pre_h, pre_s, pre_c)
+
                         steering = self.method.step(dt=self.interval)
+
+                        # Pulse + pre-entropies
+                        self.pulse.measure(self.method.organisms, pre_h)
+                        pre_entropies = {o.id: o.entropy for o in self.method.organisms}
+
+                        # Harmonic refinement
+                        h_out = self.harmonic.forward(
+                            self.method.organisms,
+                            steering.get("entropy", 0),
+                            steering.get("coherence", 1),
+                            steering.get("syntropy", 0),
+                            self._step_count,
+                        )
+                        if h_out["strength_mod"] > 0:
+                            steering["strength"] = steering.get("strength", 0.5) * h_out["strength_mod"]
+
+                        # Dissonance modulation
+                        action = steering.get("action", "wait")
+                        post_h = steering.get("entropy", pre_h)
+                        post_c = steering.get("coherence", pre_c)
+                        self.dissonance.update(action, post_h - pre_h, post_c - pre_c)
+                        steering["strength"] = min(1.0,
+                            steering.get("strength", 0.5) * self.dissonance.strength_multiplier())
+
                         self.method.write_steering(steering)
+
+                        # Attention + record + imprint
+                        self.attention.update(self.method.organisms, action, pre_entropies)
+                        strength = steering.get("strength", 0)
+                        self.syntropy.record_decision(action, strength, post_h,
+                            steering.get("syntropy", pre_s), steering.get("coherence", pre_c))
+                        self.gamma.imprint(action, strength, post_h - pre_h)
+
                         self.monitor.record(steering)
                         self._last_steering = steering
                         self._step_count += 1
@@ -423,6 +1234,16 @@ class Mycelium:
                     print(self.cmd_entropy())
                 elif line == "/coherence":
                     print(self.cmd_coherence())
+                elif line == "/gamma":
+                    print(self.cmd_gamma())
+                elif line == "/syntropy":
+                    print(self.cmd_syntropy())
+                elif line == "/harmonics":
+                    print(self.cmd_harmonics())
+                elif line == "/pulse":
+                    print(self.cmd_pulse())
+                elif line == "/attention":
+                    print(self.cmd_attention())
                 elif line == "/step":
                     s = self.step()
                     print(json.dumps(s, indent=2))
