@@ -2667,8 +2667,13 @@ impl Metabolism {
         Metabolism { mlp: MetabolismMLP::new(n_elements), n_elements }
     }
 
-    fn compute_blend_weights(&self, peer_entropies: &[f64]) -> Vec<f64> {
+    fn compute_blend_weights(&mut self, peer_entropies: &[f64]) -> Vec<f64> {
         if peer_entropies.is_empty() { return vec![]; }
+        // Resize MLP if peer count changed (mitosis/hibernation)
+        if peer_entropies.len() != self.n_elements {
+            self.n_elements = peer_entropies.len();
+            self.mlp = MetabolismMLP::new(self.n_elements);
+        }
         // Normalize inputs to [0,1]
         let max_e = peer_entropies.iter().cloned().fold(f64::NEG_INFINITY, f64::max).max(0.01);
         let inputs: Vec<f64> = peer_entropies.iter().map(|&e| e / max_e).collect();
@@ -3319,8 +3324,8 @@ fn main() {
     eprintln!("[topology] Monitor thread started (30s interval)");
 
     // Metabolism
-    let mut metabolism = Metabolism::new(5);
-    eprintln!("[metabolism] 4.C MLP initialized (5 elements, Hebbian)");
+    let mut metabolism = Metabolism::new(0);
+    eprintln!("[metabolism] 4.C MLP initialized (dynamic elements, Hebbian)");
 
     // Corpus field needs to be shared for overthinkg
     let corpus_field = Arc::new(Mutex::new(corpus_field));

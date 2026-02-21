@@ -1,6 +1,6 @@
 // molequla.go
 // A dependency-free*, single-file, goroutine-powered, continually-learning GPT organism.
-// Go port of molequla.py — same architecture, same checkpoint format, 100x faster.
+// Same architecture as C, JS, Rust. JSON checkpoint format compatible across implementations.
 //
 // * "dependency-free" = no PyTorch, no numpy, no C. One Go dep: modernc.org/sqlite (pure Go).
 //
