@@ -542,8 +542,87 @@ void am_janus_register(
 
 #endif // AM_JANUS_DISABLED
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// METHOD — distributed cognition operator
+// works on the FIELD, not individual organisms.
+// reads collective metrics, computes steering for the mouth.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#define AM_METHOD_MAX_ORGANISMS 64
+#define AM_METHOD_HISTORY_LEN   16
+
+// Per-organism data pushed by host (Python/Rust/Go)
+typedef struct {
+    int   id;
+    float entropy;
+    float syntropy;
+    float gamma_mag;       // magnitude of gamma direction vector
+    float gamma_cos;       // cosine similarity to field mean gamma (host-computed or 0)
+} AM_MethodOrganism;
+
+// METHOD steering actions
+#define AM_METHOD_WAIT     0
+#define AM_METHOD_AMPLIFY  1
+#define AM_METHOD_DAMPEN   2
+#define AM_METHOD_GROUND   3
+#define AM_METHOD_EXPLORE  4
+#define AM_METHOD_REALIGN  5
+#define AM_METHOD_SUSTAIN  6
+
+// Steering result
+typedef struct {
+    int   action;          // AM_METHOD_* constant
+    float strength;        // 0..1
+    int   target_id;       // organism id to target (-1 = none)
+    float entropy;         // field entropy
+    float syntropy;        // field syntropy
+    float coherence;       // field coherence (pairwise gamma cosine)
+    float trend;           // entropy trend (positive = organizing)
+    int   n_organisms;     // how many organisms in field
+    int   step;            // step counter
+} AM_MethodSteering;
+
+// METHOD state (internal, accessed via am_method_get_state)
+typedef struct {
+    AM_MethodOrganism organisms[AM_METHOD_MAX_ORGANISMS];
+    int n_organisms;
+
+    float entropy_history[AM_METHOD_HISTORY_LEN];
+    float coherence_history[AM_METHOD_HISTORY_LEN];
+    int history_len;
+    int history_pos;       // circular buffer position
+
+    int step_count;
+} AM_MethodState;
+
+// --- METHOD API ---
+
+// Initialize METHOD operator (call once)
+void am_method_init(void);
+
+// Clear organisms (call before pushing new snapshot)
+void am_method_clear(void);
+
+// Push one organism's data into METHOD field
+void am_method_push_organism(int id, float entropy, float syntropy,
+                             float gamma_mag, float gamma_cos);
+
+// Compute field metrics
+float am_method_field_entropy(void);
+float am_method_field_syntropy(void);
+float am_method_field_coherence(void);
+
+// Full METHOD step: compute steering from current organisms
+// Also advances AML field physics by dt seconds
+AM_MethodSteering am_method_step(float dt);
+
+// Get METHOD state (for inspection/debug)
+AM_MethodState* am_method_get_state(void);
+
 #ifdef __cplusplus
 }
+
+
 #endif
 
 #endif // ARIANNAMETHOD_H

@@ -31,6 +31,15 @@
 #include <strings.h> // for strcasecmp
 #include <stddef.h>  // for offsetof
 #include <time.h>    // for real calendar computation
+
+// BLAS acceleration (Apple Accelerate on macOS, OpenBLAS on Linux)
+#ifdef USE_BLAS
+  #ifdef ACCELERATE
+    #include <Accelerate/Accelerate.h>
+  #else
+    #include <cblas.h>
+  #endif
+#endif
 #ifndef AM_BLOOD_DISABLED
 #include <dlfcn.h>   // for dlopen, dlsym, dlclose (Blood compiler)
 #endif
@@ -2299,8 +2308,17 @@ void am_apply_delta(float* out, const float* A, const float* B,
     if (!out || !A || !B || !x || alpha == 0.0f) return;
     if (rank > 128) rank = 128;
 
-    // temp = B @ x  (rank × 1)
     float temp[128];
+
+#ifdef USE_BLAS
+    // temp = B @ x  (BLAS: sgemv)
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, rank, in_dim,
+                1.0f, B, in_dim, x, 1, 0.0f, temp, 1);
+    // out += alpha * A @ temp  (BLAS: sgemv)
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, out_dim, rank,
+                alpha, A, rank, temp, 1, 1.0f, out, 1);
+#else
+    // temp = B @ x  (rank × 1)
     for (int r = 0; r < rank; r++) {
         temp[r] = 0.0f;
         for (int j = 0; j < in_dim; j++) {
@@ -2315,6 +2333,7 @@ void am_apply_delta(float* out, const float* A, const float* B,
         }
         out[i] += alpha * sum;
     }
+#endif
 }
 
 // Compute prophecy debt from chosen token (retroactive)
@@ -2502,6 +2521,17 @@ void am_notorch_step(float* A, float* B, int out_dim, int in_dim, int rank,
         u[r] = n * k;
     }
 
+#ifdef USE_BLAS
+    // A += (lr*g) * x ⊗ u  (BLAS: rank-1 update, sger)
+    // A is [in_dim × rank], so x is the "row" vector, u is the "column" vector
+    cblas_sger(CblasRowMajor, in_dim, rank,
+               lr * g, x, 1, u, 1, A, rank);
+
+    // B += (lr*g) * u ⊗ dy  (BLAS: rank-1 update, sger)
+    // B is [rank × out_dim], so u is the "row" vector, dy is the "column" vector
+    cblas_sger(CblasRowMajor, rank, out_dim,
+               lr * g, u, 1, dy, 1, B, out_dim);
+#else
     // A[i,r] += lr * x[i] * u[r] * g
     for (int i = 0; i < in_dim; i++) {
         float xi = x[i] * lr * g;
@@ -2517,6 +2547,7 @@ void am_notorch_step(float* A, float* B, int out_dim, int in_dim, int rank,
             B[r * out_dim + j] += ur * dy[j];
         }
     }
+#endif
 
     // Adaptive decay: stronger when delta norm is large
     if (G.notorch_decay > 0.0f && G.notorch_decay < 1.0f) {
@@ -2544,6 +2575,185 @@ void am_notorch_step(float* A, float* B, int out_dim, int in_dim, int rank,
         if (B[i] > 10.0f) B[i] = 10.0f;
         if (B[i] < -10.0f) B[i] = -10.0f;
     }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// METHOD — distributed cognition operator (C implementation)
+//
+// The field operator. Works on collective organism data, not individuals.
+// Host pushes organism snapshots, METHOD computes awareness and steering.
+// From method.py → native C for speed.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static AM_MethodState M;
+
+void am_method_init(void) {
+    memset(&M, 0, sizeof(AM_MethodState));
+}
+
+void am_method_clear(void) {
+    M.n_organisms = 0;
+}
+
+void am_method_push_organism(int id, float entropy, float syntropy,
+                             float gamma_mag, float gamma_cos) {
+    if (M.n_organisms >= AM_METHOD_MAX_ORGANISMS) return;
+    AM_MethodOrganism* o = &M.organisms[M.n_organisms++];
+    o->id = id;
+    o->entropy = entropy;
+    o->syntropy = syntropy;
+    o->gamma_mag = gamma_mag;
+    o->gamma_cos = gamma_cos;
+}
+
+float am_method_field_entropy(void) {
+    if (M.n_organisms == 0) return 0.0f;
+    float sum = 0.0f;
+    for (int i = 0; i < M.n_organisms; i++)
+        sum += M.organisms[i].entropy;
+    return sum / (float)M.n_organisms;
+}
+
+float am_method_field_syntropy(void) {
+    if (M.n_organisms == 0) return 0.0f;
+    float sum = 0.0f;
+    for (int i = 0; i < M.n_organisms; i++)
+        sum += M.organisms[i].syntropy;
+    return sum / (float)M.n_organisms;
+}
+
+float am_method_field_coherence(void) {
+    if (M.n_organisms == 0) return 1.0f;
+    // Mean pairwise gamma cosine similarity
+    // Organisms push gamma_cos (precomputed vs field mean by host)
+    // But we can also compute mean of pairwise from gamma_cos values:
+    // If only one organism, perfectly coherent
+    if (M.n_organisms == 1) return 1.0f;
+
+    // Simple: mean gamma_cos across organisms (host-computed pairwise)
+    float sum = 0.0f;
+    int count = 0;
+    for (int i = 0; i < M.n_organisms; i++) {
+        if (M.organisms[i].gamma_mag > 1e-6f) {
+            sum += M.organisms[i].gamma_cos;
+            count++;
+        }
+    }
+    return count > 0 ? sum / (float)count : 1.0f;
+}
+
+AM_MethodSteering am_method_step(float dt) {
+    AM_MethodSteering s;
+    memset(&s, 0, sizeof(s));
+
+    s.n_organisms = M.n_organisms;
+    M.step_count++;
+    s.step = M.step_count;
+
+    if (M.n_organisms == 0) {
+        s.action = AM_METHOD_WAIT;
+        return s;
+    }
+
+    float entropy = am_method_field_entropy();
+    float syntropy = am_method_field_syntropy();
+    float coherence = am_method_field_coherence();
+
+    s.entropy = entropy;
+    s.syntropy = syntropy;
+    s.coherence = coherence;
+
+    // Push to circular history buffer
+    int pos = M.history_pos % AM_METHOD_HISTORY_LEN;
+    M.entropy_history[pos] = entropy;
+    M.coherence_history[pos] = coherence;
+    M.history_pos++;
+    if (M.history_len < AM_METHOD_HISTORY_LEN)
+        M.history_len++;
+
+    // Compute entropy trend (positive = organizing, negative = dissolving)
+    float trend = 0.0f;
+    if (M.history_len >= 4) {
+        // Recent 4 vs earlier 4
+        float recent = 0.0f, earlier = 0.0f;
+        int rc = 0, ec = 0;
+        for (int i = 0; i < M.history_len && i < 8; i++) {
+            int idx = ((M.history_pos - 1 - i) % AM_METHOD_HISTORY_LEN + AM_METHOD_HISTORY_LEN) % AM_METHOD_HISTORY_LEN;
+            if (i < 4) { recent += M.entropy_history[idx]; rc++; }
+            else        { earlier += M.entropy_history[idx]; ec++; }
+        }
+        if (rc > 0 && ec > 0)
+            trend = (earlier / (float)ec) - (recent / (float)rc);
+    }
+    s.trend = trend;
+
+    // Find best organism (lowest entropy)
+    int best_id = M.organisms[0].id;
+    float best_entropy = M.organisms[0].entropy;
+    for (int i = 1; i < M.n_organisms; i++) {
+        if (M.organisms[i].entropy < best_entropy) {
+            best_entropy = M.organisms[i].entropy;
+            best_id = M.organisms[i].id;
+        }
+    }
+    s.target_id = best_id;
+
+    // Decide action (same logic as method.py)
+    if (coherence < 0.3f) {
+        s.action = AM_METHOD_REALIGN;
+        s.strength = 1.0f - coherence;
+    } else if (trend > 0.05f) {
+        s.action = AM_METHOD_AMPLIFY;
+        s.strength = fminf(1.0f, trend * 5.0f);
+    } else if (trend < -0.05f) {
+        s.action = AM_METHOD_DAMPEN;
+        s.strength = fminf(1.0f, fabsf(trend) * 5.0f);
+    } else if (entropy > 2.0f) {
+        s.action = AM_METHOD_GROUND;
+        s.strength = fminf(1.0f, (entropy - 1.5f) * 0.5f);
+    } else if (entropy < 0.5f) {
+        s.action = AM_METHOD_EXPLORE;
+        s.strength = fminf(1.0f, (1.0f - entropy) * 0.5f);
+    } else {
+        s.action = AM_METHOD_SUSTAIN;
+        s.strength = 0.1f;
+    }
+
+    // Advance AML field physics
+    am_step(dt);
+
+    // Translate steering to AML state (same as method.py)
+    switch (s.action) {
+        case AM_METHOD_DAMPEN:
+            am_exec("PAIN 0.3");
+            am_exec("VELOCITY WALK");
+            break;
+        case AM_METHOD_AMPLIFY:
+            am_exec("VELOCITY RUN");
+            am_exec("DESTINY 0.6");
+            break;
+        case AM_METHOD_GROUND:
+            am_exec("ATTEND_FOCUS 0.9");
+            am_exec("VELOCITY NOMOVE");
+            break;
+        case AM_METHOD_EXPLORE:
+            am_exec("TUNNEL_CHANCE 0.3");
+            am_exec("VELOCITY RUN");
+            break;
+        case AM_METHOD_REALIGN:
+            am_exec("PAIN 0.5");
+            am_exec("ATTEND_FOCUS 0.8");
+            break;
+        default:
+            break;
+    }
+
+    return s;
+}
+
+AM_MethodState* am_method_get_state(void) {
+    return &M;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

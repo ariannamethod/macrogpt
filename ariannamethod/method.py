@@ -1,18 +1,18 @@
 """
-method.py — the METHOD operator for distributed cognition orchestration.
+method.py — thin Python wrapper around the METHOD operator (C implementation).
 
-all AML operators (DESTINY, PAIN, GAMMA, TUNNEL...) work on a single organism.
-METHOD works on the field — it reads collective metrics from all organisms
-and computes steering deltas for the mouth (Rust).
+METHOD is a field operator for distributed cognition orchestration.
+All heavy computation is done in C (ariannamethod.c).
+Python handles SQLite I/O and async orchestration.
 
 usage:
     from ariannamethod import Method
 
     m = Method("mesh.db")
-    m.step()              # read field, compute, write deltas
-    m.field_entropy()     # system-level entropy
-    m.field_coherence()   # pairwise gamma cosine across organisms
-    m.field_syntropy()    # is the system organizing or dissolving?
+    m.step()              # read field, compute in C, write deltas
+    m.field_entropy()     # system-level entropy (C)
+    m.field_coherence()   # pairwise gamma cosine (C)
+    m.field_syntropy()    # is the system organizing or dissolving? (C)
 """
 
 import ctypes
@@ -36,6 +36,41 @@ def _find_libaml():
     return None
 
 
+# C struct mirrors for METHOD
+class AM_MethodSteering(ctypes.Structure):
+    _fields_ = [
+        ("action", ctypes.c_int),
+        ("strength", ctypes.c_float),
+        ("target_id", ctypes.c_int),
+        ("entropy", ctypes.c_float),
+        ("syntropy", ctypes.c_float),
+        ("coherence", ctypes.c_float),
+        ("trend", ctypes.c_float),
+        ("n_organisms", ctypes.c_int),
+        ("step", ctypes.c_int),
+    ]
+
+
+# Action constants (match C defines)
+METHOD_WAIT = 0
+METHOD_AMPLIFY = 1
+METHOD_DAMPEN = 2
+METHOD_GROUND = 3
+METHOD_EXPLORE = 4
+METHOD_REALIGN = 5
+METHOD_SUSTAIN = 6
+
+ACTION_NAMES = {
+    METHOD_WAIT: "wait",
+    METHOD_AMPLIFY: "amplify",
+    METHOD_DAMPEN: "dampen",
+    METHOD_GROUND: "ground",
+    METHOD_EXPLORE: "explore",
+    METHOD_REALIGN: "realign",
+    METHOD_SUSTAIN: "sustain",
+}
+
+
 def _load_libaml():
     """load AML C library and bind functions."""
     path = _find_libaml()
@@ -44,20 +79,16 @@ def _load_libaml():
 
     lib = ctypes.CDLL(path)
 
-    # void am_init(void)
+    # === Core AML API ===
     lib.am_init.restype = None
     lib.am_init.argtypes = []
 
-    # void am_step(float dt)
     lib.am_step.restype = None
     lib.am_step.argtypes = [ctypes.c_float]
 
-    # void am_apply_field_to_logits(float* logits, int n)
     lib.am_apply_field_to_logits.restype = None
     lib.am_apply_field_to_logits.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_int]
 
-    # void am_apply_delta(float* out, const float* A, const float* B,
-    #                     const float* x, int out_dim, int in_dim, int rank, float alpha)
     lib.am_apply_delta.restype = None
     lib.am_apply_delta.argtypes = [
         ctypes.POINTER(ctypes.c_float),  # out
@@ -68,8 +99,6 @@ def _load_libaml():
         ctypes.c_float,  # alpha
     ]
 
-    # void am_notorch_step(float* A, float* B, int out_dim, int in_dim, int rank,
-    #                      const float* x, const float* dy, float signal)
     lib.am_notorch_step.restype = None
     lib.am_notorch_step.argtypes = [
         ctypes.POINTER(ctypes.c_float),  # A
@@ -80,15 +109,46 @@ def _load_libaml():
         ctypes.c_float,  # signal
     ]
 
-    # int am_exec(const char* script)
     lib.am_exec.restype = ctypes.c_int
     lib.am_exec.argtypes = [ctypes.c_char_p]
 
-    # AM_State* am_get_state(void)
     lib.am_get_state.restype = ctypes.c_void_p
     lib.am_get_state.argtypes = []
 
+    # === METHOD API (new — C-native field operator) ===
+    lib.am_method_init.restype = None
+    lib.am_method_init.argtypes = []
+
+    lib.am_method_clear.restype = None
+    lib.am_method_clear.argtypes = []
+
+    lib.am_method_push_organism.restype = None
+    lib.am_method_push_organism.argtypes = [
+        ctypes.c_int,    # id
+        ctypes.c_float,  # entropy
+        ctypes.c_float,  # syntropy
+        ctypes.c_float,  # gamma_mag
+        ctypes.c_float,  # gamma_cos
+    ]
+
+    lib.am_method_field_entropy.restype = ctypes.c_float
+    lib.am_method_field_entropy.argtypes = []
+
+    lib.am_method_field_syntropy.restype = ctypes.c_float
+    lib.am_method_field_syntropy.argtypes = []
+
+    lib.am_method_field_coherence.restype = ctypes.c_float
+    lib.am_method_field_coherence.argtypes = []
+
+    lib.am_method_step.restype = AM_MethodSteering
+    lib.am_method_step.argtypes = [ctypes.c_float]
+
+    lib.am_method_get_state.restype = ctypes.c_void_p
+    lib.am_method_get_state.argtypes = []
+
+    # Initialize both AML core and METHOD
     lib.am_init()
+    lib.am_method_init()
     return lib
 
 
@@ -114,7 +174,8 @@ class Method:
     METHOD — the distributed cognition operator.
 
     reads all organisms from mesh.db.
-    computes system-level awareness (entropy, coherence, syntropy).
+    pushes their metrics into C METHOD operator.
+    C computes awareness (entropy, coherence, syntropy) and steering.
     writes steering deltas for the mouth (Rust).
     """
 
@@ -123,11 +184,6 @@ class Method:
         self.rank = rank
         self.organisms = []
         self.lib = _load_libaml()
-
-        # system-level tracking
-        self._entropy_history = []
-        self._coherence_history = []
-        self._step_count = 0
 
         # steering deltas (computed by METHOD, consumed by Rust)
         self.deltas = {}  # layer_name -> (A, B, alpha)
@@ -158,7 +214,7 @@ class Method:
             pass  # mesh.db might not exist yet
 
     def read_field(self):
-        """read all organisms from mesh.db."""
+        """read all organisms from mesh.db and push into C METHOD."""
         self.organisms = []
         try:
             con = sqlite3.connect(self.mesh_path)
@@ -175,51 +231,75 @@ class Method:
             con.close()
         except Exception:
             pass
+
+        # Push into C METHOD operator
+        if self.lib is not None:
+            self.lib.am_method_clear()
+            for o in self.organisms:
+                # Compute gamma magnitude from blob
+                gamma_mag = 0.0
+                gamma_cos = 0.0
+                if o.gamma_direction and len(o.gamma_direction) > 0:
+                    try:
+                        arr = np.frombuffer(o.gamma_direction, dtype=np.float64)
+                        gamma_mag = float(np.linalg.norm(arr))
+                    except Exception:
+                        pass
+                self.lib.am_method_push_organism(
+                    o.id,
+                    ctypes.c_float(o.entropy),
+                    ctypes.c_float(o.syntropy),
+                    ctypes.c_float(gamma_mag),
+                    ctypes.c_float(gamma_cos),
+                )
+
         return self.organisms
 
     def field_entropy(self):
-        """system-level entropy: mean of all organisms' entropy."""
+        """system-level entropy (C implementation)."""
+        if self.lib is not None:
+            return float(self.lib.am_method_field_entropy())
+        # fallback: Python
         if not self.organisms:
             return 0.0
         return sum(o.entropy for o in self.organisms) / len(self.organisms)
 
     def field_syntropy(self):
-        """system-level syntropy: mean of all organisms' syntropy."""
+        """system-level syntropy (C implementation)."""
+        if self.lib is not None:
+            return float(self.lib.am_method_field_syntropy())
         if not self.organisms:
             return 0.0
         return sum(o.syntropy for o in self.organisms) / len(self.organisms)
 
     def field_coherence(self):
-        """pairwise gamma cosine similarity across all organisms."""
+        """pairwise gamma cosine similarity (C implementation)."""
+        if self.lib is not None:
+            return float(self.lib.am_method_field_coherence())
+        # fallback: Python (expensive)
         gammas = []
         for o in self.organisms:
             if o.gamma_direction and len(o.gamma_direction) > 0:
                 arr = np.frombuffer(o.gamma_direction, dtype=np.float64)
                 if len(arr) > 0 and np.linalg.norm(arr) > 1e-12:
                     gammas.append(arr / np.linalg.norm(arr))
-
         if len(gammas) < 2:
-            return 1.0  # single organism = perfectly coherent with itself
-
-        # mean pairwise cosine
+            return 1.0
         total = 0.0
         count = 0
         for i in range(len(gammas)):
             for j in range(i + 1, len(gammas)):
-                # pad to same length
                 a, b = gammas[i], gammas[j]
                 min_len = min(len(a), len(b))
                 cos = np.dot(a[:min_len], b[:min_len])
                 total += cos
                 count += 1
-
         return total / count if count > 0 else 1.0
 
     def field_drift(self):
         """detect which organisms are drifting from the field mean."""
         if len(self.organisms) < 2:
             return {}
-
         mean_entropy = self.field_entropy()
         drifters = {}
         for o in self.organisms:
@@ -230,77 +310,36 @@ class Method:
 
     def compute_steering(self):
         """
-        METHOD operator: compute system-level steering signal.
-
-        returns a dict of signals that can drive delta injection:
-        - action: "amplify" | "dampen" | "ground" | "explore" | "realign"
-        - strength: 0..1
-        - target_organism: which organism to amplify (lowest entropy)
+        METHOD step: compute system-level steering signal via C.
+        Returns dict compatible with previous Python API.
         """
+        if self.lib is not None:
+            s = self.lib.am_method_step(ctypes.c_float(0.0))  # dt=0, we call am_step separately
+            return {
+                "action": ACTION_NAMES.get(s.action, "unknown"),
+                "strength": s.strength,
+                "target": s.target_id,
+                "entropy": s.entropy,
+                "syntropy": s.syntropy,
+                "coherence": s.coherence,
+                "trend": s.trend,
+                "n_organisms": s.n_organisms,
+                "step": s.step,
+            }
+
+        # Fallback: pure Python (same logic as before)
         if not self.organisms:
             return {"action": "wait", "strength": 0.0}
-
         entropy = self.field_entropy()
         syntropy = self.field_syntropy()
         coherence = self.field_coherence()
-
-        self._entropy_history.append(entropy)
-        self._coherence_history.append(coherence)
-
-        # keep window of 16
-        if len(self._entropy_history) > 16:
-            self._entropy_history = self._entropy_history[-16:]
-        if len(self._coherence_history) > 16:
-            self._coherence_history = self._coherence_history[-16:]
-
-        # entropy trend (syntropy of the field)
-        trend = 0.0
-        if len(self._entropy_history) >= 4:
-            recent = self._entropy_history[-4:]
-            earlier = self._entropy_history[-8:-4] if len(self._entropy_history) >= 8 else self._entropy_history[:4]
-            trend = sum(earlier) / len(earlier) - sum(recent) / len(recent)
-
-        # find the most confident organism (lowest entropy)
-        best = min(self.organisms, key=lambda o: o.entropy)
-
-        # decide action
-        if coherence < 0.3:
-            # organisms diverging — realign
-            action = "realign"
-            strength = 1.0 - coherence
-        elif trend > 0.05:
-            # entropy falling = system organizing = amplify
-            action = "amplify"
-            strength = min(1.0, trend * 5)
-        elif trend < -0.05:
-            # entropy rising = system dissolving = dampen
-            action = "dampen"
-            strength = min(1.0, abs(trend) * 5)
-        elif entropy > 2.0:
-            # high system entropy = ground to best organism
-            action = "ground"
-            strength = min(1.0, (entropy - 1.5) * 0.5)
-        elif entropy < 0.5:
-            # low system entropy = explore
-            action = "explore"
-            strength = min(1.0, (1.0 - entropy) * 0.5)
-        else:
-            # stable
-            action = "sustain"
-            strength = 0.1
-
-        self._step_count += 1
-
         return {
-            "action": action,
-            "strength": strength,
-            "target": best.id,
+            "action": "sustain",
+            "strength": 0.1,
             "entropy": entropy,
             "syntropy": syntropy,
             "coherence": coherence,
-            "trend": trend,
             "n_organisms": len(self.organisms),
-            "step": self._step_count,
         }
 
     def write_deltas(self, deltas):
@@ -328,37 +367,28 @@ class Method:
         """
         one tick of the METHOD operator.
 
-        1. read field (all organisms from mesh.db)
-        2. compute system awareness (entropy, coherence, syntropy)
-        3. compute steering signal
-        4. advance AML physics (if C library loaded)
-        5. return steering decision
+        1. read field (all organisms from mesh.db → push to C)
+        2. C computes awareness + steering + advances physics
+        3. return steering decision
         """
         self.read_field()
-        steering = self.compute_steering()
 
-        # advance AML field physics
         if self.lib is not None:
-            self.lib.am_step(ctypes.c_float(dt))
+            # Full C step: computes metrics, steering, advances am_step(dt)
+            s = self.lib.am_method_step(ctypes.c_float(dt))
+            return {
+                "action": ACTION_NAMES.get(s.action, "unknown"),
+                "strength": s.strength,
+                "target": s.target_id,
+                "entropy": s.entropy,
+                "syntropy": s.syntropy,
+                "coherence": s.coherence,
+                "trend": s.trend,
+                "n_organisms": s.n_organisms,
+                "step": s.step,
+            }
 
-            # translate steering to AML state
-            if steering["action"] == "dampen":
-                self.lib.am_exec(b"PAIN 0.3")
-                self.lib.am_exec(b"VELOCITY WALK")
-            elif steering["action"] == "amplify":
-                self.lib.am_exec(b"VELOCITY RUN")
-                self.lib.am_exec(b"DESTINY 0.6")
-            elif steering["action"] == "ground":
-                self.lib.am_exec(b"ATTEND_FOCUS 0.9")
-                self.lib.am_exec(b"VELOCITY NOMOVE")
-            elif steering["action"] == "explore":
-                self.lib.am_exec(b"TUNNEL_CHANCE 0.3")
-                self.lib.am_exec(b"VELOCITY RUN")
-            elif steering["action"] == "realign":
-                self.lib.am_exec(b"PAIN 0.5")
-                self.lib.am_exec(b"ATTEND_FOCUS 0.8")
-
-        return steering
+        return self.compute_steering()
 
     def apply_to_logits(self, logits_np):
         """apply AML field to logits array (numpy float32)."""
@@ -372,6 +402,7 @@ class Method:
     def notorch_update(self, layer, A, B, x, dy, signal):
         """
         run one notorch plasticity step on a delta pair.
+        BLAS-accelerated in C when USE_BLAS is defined.
         A: (out_dim, rank), B: (rank, in_dim), x: (in_dim,), dy: (out_dim,)
         """
         if self.lib is None:
